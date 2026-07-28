@@ -9,10 +9,11 @@
 #   ./scripts/bastion-session.sh ap-southeast-2
 #   ./scripts/bastion-session.sh ap-southeast-2 --user ssm-user
 #
-# The region is a required argument, deliberately — as with every `cdk` command
-# in this repo, there is no default. The bastion's SSM parameter name is
-# identical in every region, so a defaulted region would silently open a session
-# on a different region's box.
+# The region defaults to ap-southeast-2 when omitted. Note that this differs
+# from the `cdk` commands in this repo, which never default: the bastion's SSM
+# parameter name is identical in every region, so an omitted region here lands
+# you on ap-southeast-2's box rather than erroring. The script says so on stderr
+# whenever it falls back.
 #
 # Requires: aws CLI v2 and the session-manager-plugin
 #   https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html
@@ -24,16 +25,19 @@ set -euo pipefail
 # shell script cannot call the library.
 readonly PARAM_NAME='/derrops/region/bastion/instance-id'
 
+# Region used when the caller omits one.
+readonly DEFAULT_REGION='ap-southeast-2'
+
 usage() {
   cat <<'EOF'
-Usage: bastion-session.sh <aws-region> [options]
+Usage: bastion-session.sh [aws-region] [options]
 
 Opens an interactive shell on that region's bastion via SSM Session Manager,
 as ec2-user.
 
 Arguments:
-  <aws-region>            Region the bastion lives in (e.g. ap-southeast-2).
-                          Required — there is no default.
+  [aws-region]            Region the bastion lives in (e.g. ap-southeast-2).
+                          Defaults to ap-southeast-2.
 
 Options:
   -i, --instance-id <id>  Target this instance instead of the one published at
@@ -85,9 +89,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$region" ]]; then
-  usage >&2
-  echo >&2
-  die "region is required, e.g. ./scripts/bastion-session.sh ap-southeast-2"
+  region="$DEFAULT_REGION"
+  echo "No region given — defaulting to ${region}." >&2
 fi
 
 command -v aws >/dev/null 2>&1 || die 'aws CLI not found on PATH.'
