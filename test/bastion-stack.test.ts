@@ -5,11 +5,14 @@ import { BastionStack } from '../lib/bastion-stack';
 
 const env = { account: '123456789012', region: 'us-east-1' };
 
-function synth(props: Partial<ConstructorParameters<typeof BastionStack>[2]> = {}) {
+function synth(
+  props: Partial<ConstructorParameters<typeof BastionStack>[2]> = {},
+  vpcCidr = '10.0.0.0/16',
+) {
   const app = new cdk.App();
   // A throwaway host stack to mint real CfnVPC / CfnSubnet tokens to hand in.
   const host = new cdk.Stack(app, 'Host', { env });
-  const vpc = new ec2.CfnVPC(host, 'Vpc', { cidrBlock: '10.0.0.0/16' });
+  const vpc = new ec2.CfnVPC(host, 'Vpc', { cidrBlock: vpcCidr });
   const publicSubnets = [
     new ec2.CfnSubnet(host, 'PublicA', {
       vpcId: vpc.ref,
@@ -82,16 +85,44 @@ test('the bastion role has no pinned name, so it survives a second region', () =
   });
 });
 
-test('security group allows all egress and has no inbound', () => {
+test('security group allows all egress and inbound from the VPC only', () => {
   const template = synth();
   template.hasResourceProperties('AWS::EC2::SecurityGroup', {
     GroupName: 'derrops--region--bastion--bastion',
     SecurityGroupEgress: [
       Match.objectLike({ IpProtocol: '-1', CidrIp: '0.0.0.0/0' }),
     ],
-    // No inbound rules — access is SSM-only.
-    SecurityGroupIngress: Match.absent(),
+    // Exactly one ingress rule, and its CIDR is the VPC's own (taken off the
+    // VPC, not restated in BastionStack — the host VPC above is 10.0.0.0/16).
+    // Anything from outside that range, i.e. the internet, matches nothing.
+    SecurityGroupIngress: [
+      {
+        IpProtocol: '-1',
+        CidrIp: '10.0.0.0/16',
+        Description: Match.anyValue(),
+      },
+    ],
   });
+});
+
+test('the inbound CIDR follows the VPC it is given, not a literal', () => {
+  const template = synth({}, '172.31.0.0/16');
+  template.hasResourceProperties('AWS::EC2::SecurityGroup', {
+    SecurityGroupIngress: [Match.objectLike({ CidrIp: '172.31.0.0/16' })],
+  });
+});
+
+test('the security group opens nothing to 0.0.0.0/0 inbound', () => {
+  const template = synth();
+  // The guard that matters: a public-subnet box with a public IPv4 must never
+  // grow an internet-facing ingress rule.
+  const sgs = template.findResources('AWS::EC2::SecurityGroup');
+  for (const sg of Object.values(sgs)) {
+    for (const rule of sg.Properties?.SecurityGroupIngress ?? []) {
+      expect(rule.CidrIp).not.toBe('0.0.0.0/0');
+      expect(rule.CidrIpv6).not.toBe('::/0');
+    }
+  }
 });
 
 test('publishes an instance-id discovery parameter', () => {

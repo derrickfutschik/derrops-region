@@ -97,3 +97,20 @@ All of these need `-c region=<aws-region>`:
 
 Per-stack deploy-time configuration (CDK context, props) is documented in each
 stack's file under [`docs/`](docs/).
+
+## Scripts
+
+Day-to-day operations on a deployed region live in [`scripts/`](scripts/). Each
+takes the region as an optional first argument, defaulting to `ap-southeast-2`
+— unlike the `cdk` commands, which never default.
+
+```bash
+./scripts/bastion-start.sh ap-southeast-2 --wait   # power the bastion back on
+./scripts/bastion-session.sh ap-southeast-2        # shell in over SSM Session Manager
+./scripts/bastion-stop.sh ap-southeast-2           # power it off (keeps the instance)
+
+./scripts/bastion-session.sh                       # same, implicitly ap-southeast-2
+```
+
+See [docs/derrops--region--bastion.md](docs/derrops--region--bastion.md) for
+what start/stop does and does not preserve.

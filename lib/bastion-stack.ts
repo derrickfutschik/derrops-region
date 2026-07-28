@@ -63,10 +63,15 @@ export interface BastionStackProps extends cdk.StackProps {
  *
  * ## Access
  *
- *   - **No inbound at all.** The instance profile carries
- *     `AmazonSSMManagedInstanceCore` and the security group allows all egress,
- *     so you connect with `aws ssm start-session --target <id>` — no SSH, no
- *     open ports. SSM works purely over the agent's outbound HTTPS.
+ *   - **Nothing inbound from the internet.** You connect with
+ *     `aws ssm start-session --target <id>` — no SSH from outside, no publicly
+ *     reachable port. The instance profile carries
+ *     `AmazonSSMManagedInstanceCore` and SSM works purely over the agent's
+ *     outbound HTTPS, so no ingress rule is needed for it at all.
+ *   - The security group's only ingress rule allows **all traffic from the
+ *     VPC's own CIDR**, so in-VPC hosts (and tailnet peers arriving via the
+ *     Tailscale subnet router) can reach the box on its private IP. Egress is
+ *     unrestricted.
  */
 export class BastionStack extends cdk.Stack {
   /** The bastion EC2 instance — consumers receive it by reference. */
@@ -113,13 +118,46 @@ export class BastionStack extends cdk.Stack {
       roles: [role.roleName],
     });
 
-    // ── Security group: all egress, no inbound ──────────────────────────────
-    // SSM needs only the agent's outbound HTTPS; nothing inbound is required.
+    // ── Security group: all egress, inbound from the VPC only ───────────────
+    // SSM itself needs nothing inbound (the agent dials out over HTTPS). The one
+    // ingress rule below opens the box to the VPC's own address range so
+    // in-VPC hosts can reach it directly — e.g. over the Tailscale subnet
+    // router, or for ad-hoc checks from another instance. The internet stays
+    // fully blocked: the instance has a public IPv4, but nothing outside the
+    // VPC CIDR matches the rule.
+    //
+    // The CIDR comes off the VPC rather than being restated here, so it tracks
+    // whatever `VpcStack` was given for `vpcCidr`. Prefer the VPC's own
+    // `cidrBlock` (a synth-time literal) over `attrCidrBlock`: the two stacks
+    // are separate, so the attribute would become a cross-stack export and pin
+    // the VPC's CIDR against later change. `attrCidrBlock` is the fallback for a
+    // VPC that has no literal CIDR (e.g. one allocated from an IPAM pool).
+    // Note in-VPC callers must use the bastion's *private* IP — traffic sent to
+    // its public IP leaves via the IGW and arrives with an out-of-VPC source
+    // address, which this rule does not match.
+    const vpcCidr = props.vpc.cidrBlock ?? props.vpc.attrCidrBlock;
     const sgName = naming.name({ type: 'ec2SecurityGroup', purpose: 'bastion' });
     const sg = new ec2.CfnSecurityGroup(this, 'BastionSecurityGroup', {
       groupName: sgName,
+      // Frozen, deliberately, even though it now understates the rules. EC2
+      // security-group descriptions are immutable, so CloudFormation implements
+      // any edit as a *replacement* of the group — and replacement creates the
+      // new group before deleting the old one, which collides on the fixed
+      // `groupName` above (InvalidGroup.Duplicate) and fails the update. The
+      // instance is fine either way: swapping a VPC instance's SecurityGroupIds
+      // is an in-place, no-interruption update, whatever `cdk diff`'s
+      // "may be replaced" hedge suggests. Adding the ingress rule below, on its
+      // own, is a plain in-place update of this group. The accurate description
+      // of the rules lives in the class docs and docs/derrops--region--bastion.md.
       groupDescription: 'Bastion: all egress, no inbound (access via SSM Session Manager).',
       vpcId: props.vpc.ref,
+      securityGroupIngress: [
+        {
+          ipProtocol: '-1',
+          cidrIp: vpcCidr,
+          description: 'Allow all traffic from within the VPC; nothing from the internet.',
+        },
+      ],
       securityGroupEgress: [
         {
           ipProtocol: '-1',
