@@ -162,6 +162,13 @@ test('publishes each access detail under a parameter named for its exact value',
     '/derrops/region/bastion/private-ip',
     '/derrops/region/bastion/public-ip',
     '/derrops/region/bastion/security-group-id',
+    // Sibling service namespaces — see the proxied-service tests below.
+    '/derrops/region/opensearch/host',
+    '/derrops/region/opensearch/port',
+    '/derrops/region/opensearch/url',
+    '/derrops/region/postgres/host',
+    '/derrops/region/postgres/port',
+    '/derrops/region/postgres/url',
   ]);
 
   // Each value comes off the right attribute of the right resource — the point
@@ -198,6 +205,55 @@ test('public-ip comes off the Elastic IP, never the instance', () => {
       'Fn::GetAtt': ['BastionInstance', 'PublicIp'],
     });
   }
+});
+
+test('publishes host, port and url per proxied service, in its own namespace', () => {
+  const template = synth();
+  // The service segment is the sibling service, not 'bastion' — a consumer that
+  // wants postgres looks up postgres, and the name survives the tunnel being
+  // replaced by a real database later.
+  const privateIp = { 'Fn::GetAtt': ['BastionInstance', 'PrivateIp'] };
+
+  for (const [service, scheme, port] of [
+    ['postgres', 'postgresql://', '5432'],
+    ['opensearch', 'https://', '9200'],
+  ]) {
+    // The host is the bastion's *private* IP — the public address is not
+    // reachable, so anything built on it would never connect.
+    template.hasResourceProperties('AWS::SSM::Parameter', {
+      Name: `/derrops/region/${service}/host`,
+      Value: privateIp,
+    });
+    template.hasResourceProperties('AWS::SSM::Parameter', {
+      Name: `/derrops/region/${service}/port`,
+      Value: port,
+    });
+    // url is assembled from those same two values, so the three cannot drift.
+    template.hasResourceProperties('AWS::SSM::Parameter', {
+      Name: `/derrops/region/${service}/url`,
+      Value: { 'Fn::Join': ['', [scheme, privateIp, `:${port}`]] },
+    });
+  }
+});
+
+test('proxied params are tagged for their own service, not the bastion', () => {
+  const template = synth();
+  const params = Object.values(template.findResources('AWS::SSM::Parameter'));
+  const byName = new Map(params.map((p) => [p.Properties.Name, p.Properties.Tags]));
+  // Tags must agree with the name, or a tag-based search for the postgres
+  // service silently misses its own parameters.
+  for (const key of ['host', 'port', 'url']) {
+    expect(byName.get(`/derrops/region/postgres/${key}`)).toMatchObject({
+      'derrops:service': 'postgres',
+      'derrops:domain': 'region',
+    });
+    expect(byName.get(`/derrops/region/opensearch/${key}`)).toMatchObject({
+      'derrops:service': 'opensearch',
+    });
+  }
+  expect(byName.get('/derrops/region/bastion/private-ip')).toMatchObject({
+    'derrops:service': 'bastion',
+  });
 });
 
 test('resources carry the derrops org tags', () => {

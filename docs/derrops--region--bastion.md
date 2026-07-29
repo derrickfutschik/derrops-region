@@ -153,8 +153,32 @@ subnet router.
 a Tailscale peer endpoint, an allow-list on someone else's side. That it is
 Elastic is what makes it safe to pin.
 
-No **port** is published: this stack installs no proxy. Publish one next to
-whatever you later put on the box to listen.
+### Proxied service URLs
+
+The bastion also publishes ready-made URLs for the services it fronts, under
+their **own** service namespaces rather than under `bastion`:
+
+| Parameter | Value |
+| --- | --- |
+| `/derrops/region/postgres/url` | `postgresql://<bastion private IPv4>:5432` |
+| `/derrops/region/opensearch/url` | `https://<bastion private IPv4>:9200` |
+
+That placement is deliberate: a consumer that wants postgres looks up
+**postgres**. Arriving via a tunnel on the bastion is this stack's business, not
+the caller's — and if a managed database ever replaces the tunnel, the parameter
+name does not move, only its value. Each is tagged `derrops:service` for its own
+service, so a tag-based search finds it under the right owner.
+
+Both use the private IPv4 for the host, per the rule above. Both describe the
+**intended** endpoint: this stack installs no proxy, so a URL only answers once
+the corresponding tunnel is up on the box.
+
+OpenSearch is `https` on the assumption its security plugin is enabled (the
+default). If the cluster behind the tunnel is plaintext, change the scheme in
+`lib/bastion-stack.ts`.
+
+No bare **port** parameter is published — the ports are in the URLs above, and
+this stack installs nothing that listens on them.
 
 There is no `public-dns-name` either. The instance's `PublicDnsName` attribute
 encodes the address the box had when CloudFormation created it — the

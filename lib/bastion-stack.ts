@@ -280,5 +280,85 @@ export class BastionStack extends cdk.Stack {
         description: p.description,
       });
     }
+
+    // ── URLs for the services this box fronts ───────────────────────────────
+    // These land under *sibling* service namespaces (/derrops/region/postgres,
+    // /derrops/region/opensearch) rather than under bastion, deliberately: a
+    // consumer that wants postgres looks up postgres. That the connection
+    // currently happens to arrive via a tunnel on the bastion is this stack's
+    // business, not the caller's — and if a managed database ever replaces the
+    // tunnel, the parameter name does not move, only its value. The service
+    // segment is the only thing that varies, so they derive from the same
+    // `naming` instance via `.with({ service })`; org and domain stay defined
+    // once, at the top of this file.
+    //
+    // Each service gets `host`, `port` and `url` — the two components and the
+    // assembled form — so a caller can take whichever its client wants without
+    // parsing. `url` is built from the very same host and port, never restated,
+    // so the three cannot drift apart.
+    //
+    // Host is the private IPv4, for the reason given above: no ingress rule
+    // admits traffic to the public address. Note these describe the *intended*
+    // endpoint — this stack installs no proxy, so they only answer once you
+    // have brought the corresponding tunnel up on the box.
+    const host = this.instance.attrPrivateIp;
+    const proxied = [
+      {
+        id: 'Postgres',
+        label: 'Postgres',
+        service: 'postgres',
+        // libpq's URI scheme; callers append their own /database and credentials.
+        scheme: 'postgresql',
+        port: '5432',
+      },
+      {
+        id: 'Opensearch',
+        label: 'OpenSearch',
+        service: 'opensearch',
+        // https, not http: OpenSearch ships with its security plugin enabled,
+        // so the node answers TLS on 9200. Switch to http if the thing behind
+        // the tunnel is a plaintext cluster.
+        scheme: 'https',
+        port: '9200',
+      },
+    ];
+
+    for (const p of proxied) {
+      const ns = naming.with({ service: p.service });
+      const reach = `Reachable from inside the VPC and from tailnet peers; requires the ${p.label} tunnel to be up on the bastion.`;
+
+      for (const part of [
+        {
+          id: 'Host',
+          key: 'host',
+          value: host,
+          description: `Host for ${p.label}: the region bastion's private IPv4, which proxies it. ${reach}`,
+        },
+        {
+          id: 'Port',
+          key: 'port',
+          value: p.port,
+          description: `Port for ${p.label} on the region bastion. ${reach}`,
+        },
+        {
+          id: 'Url',
+          key: 'url',
+          value: `${p.scheme}://${host}:${p.port}`,
+          description: `${p.label} URL, proxied by the region bastion (host and port as published alongside). ${reach}`,
+        },
+      ]) {
+        const param = new ssm.StringParameter(this, `${p.id}${part.id}Param`, {
+          parameterName: ns.name({ type: 'ssmParam', key: part.key }),
+          stringValue: part.value,
+          description: part.description,
+        });
+        // Re-tag from the sibling instance, overriding the stack-wide
+        // derrops:service=bastion these would otherwise inherit. The tags have
+        // to agree with the name: a parameter called /derrops/region/postgres/url
+        // tagged as the bastion service is exactly the kind of thing that makes
+        // a tag-based search quietly wrong.
+        ns.applyTags((k, v) => cdk.Tags.of(param).add(k, v));
+      }
+    }
   }
 }
