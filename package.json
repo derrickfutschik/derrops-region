@@ -6,8 +6,11 @@
     "watch": "tsc -w",
     "test": "jest",
     "cdk": "cdk",
-    "deploy": "cdk deploy --all",
-    "deploy:stack": "cdk deploy"
+    "deploy": "cdk deploy --all -c region=ap-southeast-2",
+    "deploy:stack": "cdk deploy -c region=ap-southeast-2",
+    "diff": "cdk diff -c region=ap-southeast-2",
+    "synth": "cdk synth -c region=ap-southeast-2",
+    "list": "cdk list --long -c region=ap-southeast-2"
   },
   "devDependencies": {
     "@types/jest": "^30",

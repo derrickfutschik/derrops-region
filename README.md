@@ -86,7 +86,8 @@ aws ssm get-parameter --region us-east-1 \
 
 ## Useful commands
 
-All of these need `-c region=<aws-region>`:
+Every `cdk` invocation needs `-c region=<aws-region>` — the app throws without
+it and has no fallback:
 
 - `npm run build` — compile TypeScript
 - `npm test` — run the Jest assertion tests (no region needed; tests set their own)
@@ -94,6 +95,20 @@ All of these need `-c region=<aws-region>`:
 - `npx cdk synth -c region=ap-southeast-2` — emit the synthesized template(s)
 - `npx cdk diff -c region=ap-southeast-2` — compare against what's deployed there
 - `npx cdk deploy --all -c region=ap-southeast-2` — deploy
+
+The `npm` wrappers pass `-c region=ap-southeast-2` for you, matching the default
+in [`scripts/`](scripts/). The default lives in `package.json`, **not** in the
+app — `bin/region-bootstrap.ts` still refuses to run without an explicit region,
+so nothing that reaches the CDK app can be silently mis-targeted:
+
+- `npm run list` / `npm run synth` / `npm run diff`
+- `npm run deploy` — deploy every stack
+- `npm run deploy:stack <stack>` — deploy one
+
+Append `-- -c region=<other>` to point any of them elsewhere; the later `-c`
+wins, so `npm run diff -- -c region=us-east-1` diffs us-east-1. Unlike the
+`scripts/`, these do not announce the fallback — check what you are about to
+deploy into with `npm run diff` first.
 
 Per-stack deploy-time configuration (CDK context, props) is documented in each
 stack's file under [`docs/`](docs/).

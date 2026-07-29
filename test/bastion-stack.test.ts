@@ -88,7 +88,9 @@ test('the bastion role has no pinned name, so it survives a second region', () =
 test('security group allows all egress and inbound from the VPC only', () => {
   const template = synth();
   template.hasResourceProperties('AWS::EC2::SecurityGroup', {
-    GroupName: 'derrops--region--bastion--bastion',
+    // No `purpose` segment — the service is already 'bastion', so adding one
+    // would stutter (derrops--region--bastion--bastion).
+    GroupName: 'derrops--region--bastion',
     SecurityGroupEgress: [
       Match.objectLike({ IpProtocol: '-1', CidrIp: '0.0.0.0/0' }),
     ],
@@ -130,6 +132,72 @@ test('publishes an instance-id discovery parameter', () => {
   template.hasResourceProperties('AWS::SSM::Parameter', {
     Name: '/derrops/region/bastion/instance-id',
   });
+});
+
+test('allocates a VPC Elastic IP and associates it with the instance', () => {
+  const template = synth();
+  template.resourceCountIs('AWS::EC2::EIP', 1);
+  template.hasResourceProperties('AWS::EC2::EIP', {
+    Domain: 'vpc',
+    // An EIP has no name property — the convention name lands on the Name tag.
+    // `ec2ElasticIp` is an org/domain/service type, so there is no key segment.
+    Tags: Match.arrayWith([{ Key: 'Name', Value: 'derrops--region--bastion' }]),
+  });
+  template.resourceCountIs('AWS::EC2::EIPAssociation', 1);
+  template.hasResourceProperties('AWS::EC2::EIPAssociation', {
+    AllocationId: { 'Fn::GetAtt': [Match.anyValue(), 'AllocationId'] },
+    InstanceId: { Ref: Match.anyValue() },
+  });
+});
+
+test('publishes each access detail under a parameter named for its exact value', () => {
+  const template = synth();
+  const params = Object.values(template.findResources('AWS::SSM::Parameter'));
+  const byName = new Map(params.map((p) => [p.Properties.Name, p.Properties.Value]));
+
+  expect([...byName.keys()].sort()).toEqual([
+    '/derrops/region/bastion/eip-allocation-id',
+    '/derrops/region/bastion/instance-id',
+    '/derrops/region/bastion/private-dns-name',
+    '/derrops/region/bastion/private-ip',
+    '/derrops/region/bastion/public-ip',
+    '/derrops/region/bastion/security-group-id',
+  ]);
+
+  // Each value comes off the right attribute of the right resource — the point
+  // of naming them precisely is defeated if one carries the wrong address.
+  expect(byName.get('/derrops/region/bastion/private-ip')).toEqual({
+    'Fn::GetAtt': ['BastionInstance', 'PrivateIp'],
+  });
+  expect(byName.get('/derrops/region/bastion/private-dns-name')).toEqual({
+    'Fn::GetAtt': ['BastionInstance', 'PrivateDnsName'],
+  });
+  expect(byName.get('/derrops/region/bastion/security-group-id')).toEqual({
+    'Fn::GetAtt': ['BastionSecurityGroup', 'GroupId'],
+  });
+  expect(byName.get('/derrops/region/bastion/eip-allocation-id')).toEqual({
+    'Fn::GetAtt': ['BastionEip', 'AllocationId'],
+  });
+});
+
+test('public-ip comes off the Elastic IP, never the instance', () => {
+  const template = synth();
+  const params = Object.values(template.findResources('AWS::SSM::Parameter'));
+  const publicIp = params.find(
+    (p) => p.Properties.Name === '/derrops/region/bastion/public-ip',
+  );
+  // The instance's own PublicIp/PublicDnsName attributes are captured at create
+  // time, before the EIP is associated, so they would be stale forever. The EIP
+  // is the authoritative source for the address.
+  expect(publicIp?.Properties.Value).toEqual({
+    'Fn::GetAtt': ['BastionEip', 'PublicIp'],
+  });
+  for (const p of params) {
+    expect(JSON.stringify(p.Properties.Value)).not.toContain('PublicDnsName');
+    expect(p.Properties.Value).not.toEqual({
+      'Fn::GetAtt': ['BastionInstance', 'PublicIp'],
+    });
+  }
 });
 
 test('resources carry the derrops org tags', () => {

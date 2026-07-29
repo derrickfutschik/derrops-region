@@ -29,7 +29,14 @@ here.
 - `npx cdk deploy --all -c region=<aws-region>` — deploy a whole region.
 
 **Every `cdk` command needs `-c region=<aws-region>`.** The app throws without
-it. Never add a default.
+it. Never add a default *to the app*.
+
+The `npm` wrappers (`npm run deploy` / `deploy:stack` / `diff` / `synth` /
+`list`) supply `-c region=ap-southeast-2` in `package.json`, matching the
+`scripts/` default. That is a convenience at the call site only — the region
+still arrives at `bin/region-bootstrap.ts` as an explicit context value. Keep it
+that way: the default belongs in `package.json`, never in the app. Override with
+`-- -c region=<other>` (the later `-c` wins).
 
 ## The region is an explicit input
 

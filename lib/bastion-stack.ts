@@ -58,8 +58,9 @@ export interface BastionStackProps extends cdk.StackProps {
  *     agent preinstalled).
  *   - Lives in a **public subnet** (`publicSubnets[0]`) so it reaches the SSM
  *     endpoints (and later the Tailscale coordination server) over the free IGW
- *     — no NAT Gateway. The subnet's `mapPublicIpOnLaunch` gives it a public
- *     IPv4 (~$3.6/mo), which also aids Tailscale NAT traversal later.
+ *     — no NAT Gateway. An **Elastic IP** is associated so that public IPv4
+ *     (~$3.6/mo) is stable across stop/start, which also aids Tailscale NAT
+ *     traversal later. Its address is published to SSM as `.../endpoint`.
  *
  * ## Access
  *
@@ -136,20 +137,24 @@ export class BastionStack extends cdk.Stack {
     // its public IP leaves via the IGW and arrives with an out-of-VPC source
     // address, which this rule does not match.
     const vpcCidr = props.vpc.cidrBlock ?? props.vpc.attrCidrBlock;
-    const sgName = naming.name({ type: 'ec2SecurityGroup', purpose: 'bastion' });
+    // No `purpose` segment: this stack's service *is* the bastion, so a
+    // `purpose: 'bastion'` would only stutter (derrops--region--bastion--bastion)
+    // for the one security group here. Add one if a second group ever appears.
+    const sgName = naming.name({ type: 'ec2SecurityGroup' });
     const sg = new ec2.CfnSecurityGroup(this, 'BastionSecurityGroup', {
       groupName: sgName,
-      // Frozen, deliberately, even though it now understates the rules. EC2
-      // security-group descriptions are immutable, so CloudFormation implements
-      // any edit as a *replacement* of the group — and replacement creates the
-      // new group before deleting the old one, which collides on the fixed
-      // `groupName` above (InvalidGroup.Duplicate) and fails the update. The
-      // instance is fine either way: swapping a VPC instance's SecurityGroupIds
-      // is an in-place, no-interruption update, whatever `cdk diff`'s
-      // "may be replaced" hedge suggests. Adding the ingress rule below, on its
-      // own, is a plain in-place update of this group. The accurate description
-      // of the rules lives in the class docs and docs/derrops--region--bastion.md.
-      groupDescription: 'Bastion: all egress, no inbound (access via SSM Session Manager).',
+      // EC2 security-group descriptions are immutable, so CloudFormation
+      // implements any edit as a *replacement* of the group. That is normally
+      // the thing to avoid here — replacement creates the new group before
+      // deleting the old one, which would collide on the fixed `groupName`
+      // above (InvalidGroup.Duplicate) — but the rename to the stutter-free
+      // name replaces the group anyway, and under a name the old group does not
+      // hold, so this description could finally be corrected to match the rules
+      // in the same deployment. Treat it as frozen again from here.
+      // The instance is fine either way: swapping a VPC instance's
+      // SecurityGroupIds is an in-place, no-interruption update, whatever
+      // `cdk diff`'s "may be replaced" hedge suggests.
+      groupDescription: 'Bastion: all egress, inbound from the VPC CIDR only (no internet ingress; SSM Session Manager needs none).',
       vpcId: props.vpc.ref,
       securityGroupIngress: [
         {
@@ -179,11 +184,101 @@ export class BastionStack extends cdk.Stack {
     });
     cdk.Tags.of(this.instance).add('Name', instanceName);
 
-    // ── Discovery for out-of-app areas (SDK/CLI read at runtime) ────────────
-    new ssm.StringParameter(this, 'BastionInstanceIdParam', {
-      parameterName: naming.name({ type: 'ssmParam', key: 'instance-id' }),
-      stringValue: this.instance.ref,
-      description: 'Instance ID of the bastion (connect via SSM Session Manager).',
+    // ── Elastic IP ──────────────────────────────────────────────────────────
+    // The subnet's `mapPublicIpOnLaunch` already gives the box a public IPv4,
+    // but that address is re-drawn on every stop/start, so nothing can be
+    // pinned to it. An EIP makes the address stable for the life of the stack —
+    // worth it for a Tailscale box, whose peers benefit from a fixed endpoint,
+    // and for anything (DNS, an allow-list elsewhere) that wants to name the
+    // bastion by address. Associating it *replaces* the auto-assigned address,
+    // so this is one public IPv4 either way while the instance runs; it does
+    // add the idle-address charge (~$3.6/mo) for the time the box is stopped.
+    //
+    // An EIP has no name property — only tags — so the convention name goes on
+    // the `Name` tag. `ec2ElasticIp` is an org/domain/service type (no `key`).
+    const eipName = naming.name({ type: 'ec2ElasticIp' });
+    const eip = new ec2.CfnEIP(this, 'BastionEip', {
+      // 'vpc' allocates from the VPC address pool — required for an EIP that
+      // attaches to a VPC instance by allocation id.
+      domain: 'vpc',
     });
+    cdk.Tags.of(eip).add('Name', eipName);
+
+    new ec2.CfnEIPAssociation(this, 'BastionEipAssociation', {
+      allocationId: eip.attrAllocationId,
+      instanceId: this.instance.ref,
+    });
+
+    // ── Discovery for out-of-app areas (SDK/CLI read at runtime) ────────────
+    // Each parameter is named for exactly what it holds — there is no generic
+    // `host`/`endpoint` alias, because *which* address is the right host is not
+    // a detail a consumer can be allowed to skip. Once this box proxies
+    // something (postgres, opensearch, …) and callers build a
+    // `protocol://host:port` URL, the host is `private-ip`: the security group
+    // admits only the VPC's own CIDR, so a connection to the public address
+    // from anywhere — including from inside the VPC, where it leaves via the
+    // IGW and returns with an out-of-VPC source — matches no ingress rule and
+    // is dropped. `public-ip` is published to *identify* the box (DNS records,
+    // an allow-list on someone else's side), not to connect to.
+    //
+    // The port belongs to whatever proxy you later run on the box; this stack
+    // installs nothing, so it publishes no port. Add one here alongside the
+    // thing that listens on it.
+    //
+    // There is deliberately no `public-dns-name`: the instance's PublicDnsName
+    // attribute encodes the address the box had when CloudFormation created it
+    // — the auto-assigned one — and the EIP is associated afterwards, so the
+    // value would be captured stale and never corrected. `public-ip` is read
+    // off the EIP itself, which is authoritative.
+    const discovery = [
+      {
+        id: 'BastionInstanceIdParam',
+        key: 'instance-id',
+        value: this.instance.ref,
+        description: 'Instance ID of the bastion (SSM Session Manager target).',
+      },
+      {
+        id: 'BastionPrivateIpParam',
+        key: 'private-ip',
+        value: this.instance.attrPrivateIp,
+        description:
+          'Private IPv4 of the bastion. The host for protocol://host:port — the only address the security group admits, reachable from inside the VPC and from tailnet peers via the subnet router. Survives stop/start.',
+      },
+      {
+        id: 'BastionPrivateDnsNameParam',
+        key: 'private-dns-name',
+        value: this.instance.attrPrivateDnsName,
+        description:
+          'Internal DNS name of the bastion, resolving to its private IPv4 inside the VPC. Same reachability as private-ip; prefer it if you would rather not pin an address.',
+      },
+      {
+        id: 'BastionPublicIpParam',
+        key: 'public-ip',
+        value: eip.attrPublicIp,
+        description:
+          'Elastic IP of the bastion: its stable public IPv4, fixed across stop/start. An identifier, not a way in — no ingress rule admits traffic to it.',
+      },
+      {
+        id: 'BastionEipAllocationIdParam',
+        key: 'eip-allocation-id',
+        value: eip.attrAllocationId,
+        description: 'Allocation ID of the bastion Elastic IP (for re-association).',
+      },
+      {
+        id: 'BastionSecurityGroupIdParam',
+        key: 'security-group-id',
+        value: sg.attrGroupId,
+        description:
+          "ID of the bastion's security group — reference it as a source in another group's rules.",
+      },
+    ];
+
+    for (const p of discovery) {
+      new ssm.StringParameter(this, p.id, {
+        parameterName: naming.name({ type: 'ssmParam', key: p.key }),
+        stringValue: p.value,
+        description: p.description,
+      });
+    }
   }
 }
