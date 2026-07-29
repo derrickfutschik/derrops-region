@@ -63,7 +63,7 @@ account-global and therefore left unnamed — see
 ## Stacks
 
 Each stack is documented in its own file under [`docs/`](docs/), named after the
-stack's generated name. Deploy order (enforced via `addDependency`):
+stack's generated name. Deploy order (enforced via `addStackDependency`):
 `derrops--region--network` → `derrops--region--bastion`, since the bastion
 consumes the VPC's public subnets.
 

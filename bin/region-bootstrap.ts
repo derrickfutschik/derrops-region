@@ -47,6 +47,6 @@ const bastion = new BastionStack(
     publicSubnets: vpc.publicSubnets,
   },
 );
-bastion.addDependency(vpc);
+bastion.addStackDependency(vpc);
 
 app.synth();

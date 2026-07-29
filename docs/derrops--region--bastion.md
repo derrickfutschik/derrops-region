@@ -153,32 +153,137 @@ subnet router.
 a Tailscale peer endpoint, an allow-list on someone else's side. That it is
 Elastic is what makes it safe to pin.
 
-### Proxied service URLs
+### Proxied services
 
-The bastion also publishes ready-made URLs for the services it fronts, under
-their **own** service namespaces rather than under `bastion`:
+For each service the bastion fronts, it publishes `host`, `port` and `url` —
+the two components and the assembled form — under that service's **own**
+namespace rather than under `bastion`:
 
 | Parameter | Value |
 | --- | --- |
-| `/derrops/region/postgres/url` | `postgresql://<bastion private IPv4>:5432` |
-| `/derrops/region/opensearch/url` | `https://<bastion private IPv4>:9200` |
+| `/derrops/region/postgres/host` | the bastion's private IPv4 |
+| `/derrops/region/postgres/port` | `5432` |
+| `/derrops/region/postgres/url` | `postgresql://<host>:5432` |
+| `/derrops/region/opensearch/host` | the bastion's private IPv4 |
+| `/derrops/region/opensearch/port` | `9200` |
+| `/derrops/region/opensearch/url` | `https://<host>:9200` |
 
-That placement is deliberate: a consumer that wants postgres looks up
+`url` is assembled from the very same host and port, never restated, so the
+three cannot drift apart — take whichever your client wants (a `psql` URI, or
+separate `PGHOST`/`PGPORT`) without parsing.
+
+The placement is deliberate: a consumer that wants postgres looks up
 **postgres**. Arriving via a tunnel on the bastion is this stack's business, not
 the caller's — and if a managed database ever replaces the tunnel, the parameter
-name does not move, only its value. Each is tagged `derrops:service` for its own
-service, so a tag-based search finds it under the right owner.
+names do not move, only their values. Each is tagged `derrops:service` for its
+own service, so a tag-based search finds it under the right owner.
 
-Both use the private IPv4 for the host, per the rule above. Both describe the
-**intended** endpoint: this stack installs no proxy, so a URL only answers once
+The host is the private IPv4, per the rule above. All of these describe the
+**intended** endpoint: this stack installs no proxy, so they only answer once
 the corresponding tunnel is up on the box.
 
 OpenSearch is `https` on the assumption its security plugin is enabled (the
 default). If the cluster behind the tunnel is plaintext, change the scheme in
 `lib/bastion-stack.ts`.
 
-No bare **port** parameter is published — the ports are in the URLs above, and
-this stack installs nothing that listens on them.
+```bash
+psql "$(aws ssm get-parameter --region ap-southeast-2 \
+  --name /derrops/region/postgres/url --query Parameter.Value --output text)/mydb"
+```
+
+### Credentials
+
+Each service also gets a **`SecureString`** parameter per user:
+
+| Parameter |
+| --- |
+| `/derrops/region/postgres/users/derrops-platform` |
+| `/derrops/region/opensearch/users/derrops-platform` |
+
+`users` is the key and the username is the `purpose` segment, so the library
+builds the path — the key itself never contains a `/`. One parameter per user
+puts the grant boundary at the parameter: an IAM policy can scope to
+`/derrops/region/postgres/users/*` or to a single user.
+
+#### The datasource-credentials convention
+
+The value is a **complete datasource descriptor**, not a bare password — one
+read hands a client everything it needs to connect. This is the shape Secrets
+Manager writes for an RDS secret, so a consumer that already understands one
+understands these. It is documented in each parameter's own `description`, since
+whoever opens it in the console to set the real password is exactly who needs to
+know the shape and is not reading the CDK source.
+
+Postgres — `engine`, `host`, `port`, `dbname`, `username`, `password`:
+
+```json
+{
+  "engine": "postgres",
+  "host": "10.0.4.189",
+  "port": 5432,
+  "dbname": "postgres",
+  "username": "derrops-platform",
+  "password": "super-secret-password"
+}
+```
+
+OpenSearch — the same, plus what an HTTP datasource needs: `protocol`, and
+`endpoint` pre-assembled so a client need not join scheme/host/port itself:
+
+```json
+{
+  "engine": "opensearch",
+  "host": "10.0.4.189",
+  "port": 9200,
+  "protocol": "https",
+  "endpoint": "https://10.0.4.189:9200",
+  "username": "derrops-platform",
+  "password": "super-secret-password"
+}
+```
+
+Two values are worth calling out because they differ from what a *managed* AWS
+datasource would carry:
+
+- **`host` is the bastion's private IPv4**, not an RDS/OpenSearch endpoint —
+  everything here is reached through the tunnel on the box.
+- **OpenSearch `port` is 9200**, not the 443 of a managed OpenSearch domain,
+  matching `/derrops/region/opensearch/port`.
+
+The `host`, `port` and `endpoint` fields are **seed-time** values: they are
+written once and never re-asserted (see below), so if the bastion instance is
+ever replaced they go stale in this blob while
+`/derrops/region/<service>/{host,port,url}` update with the stack. Those
+sibling parameters are the authoritative ones for connectivity; treat this blob
+as authoritative for **credentials**.
+
+**These are seeded, not managed.** CloudFormation's `AWS::SSM::Parameter` cannot
+create a `SecureString` at all, so they go through
+[`SeedParameter`](../lib/seed-parameter.ts) — an `AwsCustomResource` calling
+`ssm:PutParameter` with `Overwrite: false`, which writes only if the parameter
+is absent. Encryption uses the account's default `alias/aws/ssm` key.
+
+The seeded blob carries `"password": "REPLACE-ME"`, and it **reaches the
+CloudFormation template in plaintext** — that is why the password is a
+placeholder while every other field is real. Set the real value out-of-band,
+once:
+
+```bash
+aws ssm put-parameter --region ap-southeast-2 \
+  --name /derrops/region/postgres/users/derrops-platform \
+  --type SecureString --overwrite \
+  --value '{"engine":"postgres","host":"10.0.4.189","port":5432,"dbname":"postgres","username":"derrops-platform","password":"…"}'
+```
+
+`Overwrite: false` is what makes that safe: after the first seed, no `cdk deploy`
+re-asserts, re-seeds, or diffs the live value, so the real credentials survive
+every future deployment. A test asserts the template carries only the
+placeholder.
+
+If these ever need rotation, cross-account access, or generated passwords,
+that is the point to move them to Secrets Manager — SSM `SecureString` is the
+cheap option (free at standard tier, versus ~$0.40/secret/month) and does none
+of those three.
 
 There is no `public-dns-name` either. The instance's `PublicDnsName` attribute
 encodes the address the box had when CloudFormation created it — the

@@ -4,6 +4,21 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { DerropsConventions } from 'derrops-conventions';
+import { SeedParameter } from './seed-parameter';
+
+/**
+ * The platform's own user on each service the bastion fronts. One constant, so
+ * the spelling is fixed in a single place — it becomes an SSM parameter path
+ * that outside consumers pin against.
+ */
+const PLATFORM_USER = { id: 'DerropsPlatform', name: 'derrops-platform' };
+
+/**
+ * Seeded into every credentials parameter, and never a real secret: the value
+ * reaches the CloudFormation template in plaintext. `SeedParameter` writes it
+ * only when the parameter is absent, so replacing it out-of-band is permanent.
+ */
+const PLACEHOLDER_SECRET = 'REPLACE-ME';
 
 /**
  * Design-time naming segments for the bastion stack. Every resource name, the
@@ -307,19 +322,53 @@ export class BastionStack extends cdk.Stack {
         id: 'Postgres',
         label: 'Postgres',
         service: 'postgres',
+        user: PLATFORM_USER,
         // libpq's URI scheme; callers append their own /database and credentials.
         scheme: 'postgresql',
         port: '5432',
+        // The datasource-credentials convention: engine/host/port/dbname plus
+        // the user. Same shape Secrets Manager writes for an RDS secret, so a
+        // consumer that already understands one understands this.
+        credentials: {
+          engine: 'postgres',
+          host,
+          port: 5432,
+          // The always-present default database — a real value rather than a
+          // placeholder, since it is right until someone provisions another.
+          dbname: 'postgres',
+          username: PLATFORM_USER.name,
+          password: PLACEHOLDER_SECRET,
+        },
+        shape:
+          '{"engine":"postgres","host":…,"port":5432,"dbname":…,"username":…,"password":…}',
       },
       {
         id: 'Opensearch',
         label: 'OpenSearch',
         service: 'opensearch',
+        user: PLATFORM_USER,
         // https, not http: OpenSearch ships with its security plugin enabled,
         // so the node answers TLS on 9200. Switch to http if the thing behind
         // the tunnel is a plaintext cluster.
         scheme: 'https',
         port: '9200',
+        // Same convention, with the fields an HTTP datasource needs on top:
+        // protocol, and `endpoint` pre-assembled so a client need not join
+        // scheme/host/port itself.
+        credentials: {
+          engine: 'opensearch',
+          host,
+          // 9200, not the 443 of a managed OpenSearch domain: this is the port
+          // the tunnel on the bastion listens on, and it matches the sibling
+          // /derrops/region/opensearch/port parameter.
+          port: 9200,
+          protocol: 'https',
+          endpoint: `https://${host}:9200`,
+          username: PLATFORM_USER.name,
+          password: PLACEHOLDER_SECRET,
+        },
+        shape:
+          '{"engine":"opensearch","host":…,"port":9200,"protocol":"https","endpoint":…,"username":…,"password":…}',
       },
     ];
 
@@ -359,6 +408,31 @@ export class BastionStack extends cdk.Stack {
         // a tag-based search quietly wrong.
         ns.applyTags((k, v) => cdk.Tags.of(param).add(k, v));
       }
+
+      // ── Credentials, seeded once ─────────────────────────────────────────
+      // `users` + the username as `purpose`, so the library builds the path —
+      // never a '/' inside a key. One parameter per user keeps the grant
+      // boundary at the parameter: an IAM policy can scope to
+      // /derrops/region/postgres/users/* or to a single user.
+      //
+      // Seeded, not managed: the value below is a placeholder that reaches the
+      // template in plaintext, and `SeedParameter` writes it only if the
+      // parameter does not already exist. Set the real credentials out-of-band
+      // once (see docs), and no later deploy re-asserts or diffs them.
+      new SeedParameter(this, `${p.id}${p.user.id}CredentialsParam`, {
+        parameterName: ns.name({ type: 'ssmParam', key: 'users', purpose: p.user.name }),
+        type: 'SecureString',
+        value: JSON.stringify(p.credentials),
+        // The shape is documented on the parameter itself: whoever opens this in
+        // the console to set the real password is exactly who needs to know what
+        // the JSON must contain, and they are not reading this file.
+        description: [
+          `${p.label} credentials for the ${p.user.name} user, reached via the region bastion.`,
+          `SecureString, seeded with a placeholder password (${PLACEHOLDER_SECRET}) — set the real value with: aws ssm put-parameter --name <this> --type SecureString --overwrite --value '<json>'.`,
+          `Shape: ${p.shape}`,
+          `The host/port fields are seed-time values and are never re-asserted; /derrops/region/${p.service}/{host,port,url} are the authoritative connectivity parameters.`,
+        ].join(' '),
+      });
     }
   }
 }

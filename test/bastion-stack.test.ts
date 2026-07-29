@@ -256,6 +256,119 @@ test('proxied params are tagged for their own service, not the bastion', () => {
   });
 });
 
+/**
+ * The SDK call is a JSON string with the bastion's private IP spliced in as a
+ * GetAtt, so it synthesizes to an Fn::Join. Substitute a stand-in address for
+ * the token and parse it back into the call it will actually make.
+ */
+function seededCalls(template: Template) {
+  return Object.values(template.findResources('Custom::SeedSsmParameter')).map((s) => {
+    const create = s.Properties.Create;
+    const joined =
+      typeof create === 'string'
+        ? create
+        : create['Fn::Join'][1]
+            .map((part: unknown) => (typeof part === 'string' ? part : '10.0.4.189'))
+            .join('');
+    return JSON.parse(joined);
+  });
+}
+
+test('seeds a SecureString credentials parameter per proxied service', () => {
+  const template = synth();
+  const created = seededCalls(template);
+  expect(created).toHaveLength(2);
+  // `users` + username as `purpose`, so the library builds the path — the key
+  // itself never contains a '/'.
+  expect(created.map((c) => c.parameters.Name).sort()).toEqual([
+    '/derrops/region/opensearch/users/derrops-platform',
+    '/derrops/region/postgres/users/derrops-platform',
+  ]);
+
+  for (const c of created) {
+    // CloudFormation's AWS::SSM::Parameter cannot create a SecureString at all,
+    // which is why these are SDK calls rather than managed parameters.
+    expect(c.parameters.Type).toBe('SecureString');
+    // Create-if-absent: the real value, set out-of-band, is never clobbered by
+    // a later deploy, and never diffed against the placeholder.
+    expect(c.parameters.Overwrite).toBe(false);
+    expect(c.ignoreErrorCodesMatching).toBe('ParameterAlreadyExists');
+  }
+});
+
+test('no real credential is baked into the template', () => {
+  const template = synth();
+  // The seeded value reaches the template in plaintext, so the password must
+  // stay a recognisable placeholder. If someone ever pastes a real secret into
+  // PLACEHOLDER_SECRET, this is the test that should stop them.
+  for (const call of seededCalls(template)) {
+    expect(JSON.parse(call.parameters.Value).password).toBe('REPLACE-ME');
+  }
+});
+
+test('credentials follow the datasource convention, documented on the parameter', () => {
+  const template = synth();
+  const byName = new Map(seededCalls(template).map((c) => [c.parameters.Name, c.parameters]));
+
+  // engine/host/port/dbname + user — the shape Secrets Manager writes for an
+  // RDS secret, so a consumer that understands one understands this.
+  expect(
+    JSON.parse(byName.get('/derrops/region/postgres/users/derrops-platform')!.Value),
+  ).toEqual({
+    engine: 'postgres',
+    host: '10.0.4.189', // the bastion's private IP token
+    port: 5432,
+    dbname: 'postgres',
+    username: 'derrops-platform',
+    password: 'REPLACE-ME',
+  });
+
+  // Same, plus what an HTTP datasource needs: protocol, and a pre-assembled
+  // endpoint so a client need not join scheme/host/port itself. Port 9200 (the
+  // tunnel on the bastion), not the 443 of a managed OpenSearch domain.
+  expect(
+    JSON.parse(byName.get('/derrops/region/opensearch/users/derrops-platform')!.Value),
+  ).toEqual({
+    engine: 'opensearch',
+    host: '10.0.4.189',
+    port: 9200,
+    protocol: 'https',
+    endpoint: 'https://10.0.4.189:9200',
+    username: 'derrops-platform',
+    password: 'REPLACE-ME',
+  });
+
+  for (const [name, params] of byName) {
+    // Whoever opens this in the console to set the real password is exactly who
+    // needs to know the shape, and they are not reading the CDK source.
+    expect(params.Description).toContain('"engine"');
+    expect(params.Description).toContain('put-parameter');
+    // SSM caps descriptions at 1024 characters.
+    expect(params.Description.length).toBeLessThanOrEqual(1024);
+    expect(name).toMatch(/\/users\/derrops-platform$/);
+  }
+});
+
+test('the seeding role can encrypt only via SSM in this region', () => {
+  const template = synth();
+  // The default alias/aws/ssm key has no knowable ARN, so the kms grant is
+  // resource '*' — scoped by ViaService so the lambda cannot turn it on another
+  // service's keys.
+  template.hasResourceProperties('AWS::IAM::Policy', {
+    PolicyDocument: {
+      Statement: Match.arrayWith([
+        Match.objectLike({
+          Action: ['kms:Encrypt', 'kms:GenerateDataKey'],
+          Resource: '*',
+          Condition: {
+            StringEquals: { 'kms:ViaService': 'ssm.us-east-1.amazonaws.com' },
+          },
+        }),
+      ]),
+    },
+  });
+});
+
 test('resources carry the derrops org tags', () => {
   const template = synth();
   for (const tag of [

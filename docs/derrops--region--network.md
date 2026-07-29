@@ -119,7 +119,7 @@ aws ssm get-parameter --region ap-southeast-2 \
 
 The region itself is **required** and comes from `-c region=<aws-region>`; the
 stack throws if it would synth without a concrete region. Independent of the
-bastion stack — no `addDependency` wiring in this direction.
+bastion stack — no `addStackDependency` wiring in this direction.
 
 ```bash
 npx cdk deploy 'derrops--region--network' -c region=ap-southeast-2

@@ -105,8 +105,15 @@ Shared config lives in SSM Parameter Store, meant to be read at **runtime** (SSM
   subnet ids; `BastionStack` publishes its instance id). The same parameter name
   exists independently in each region — every read needs an explicit `--region`.
 - Derived values that should track the stack use plain `ssm.StringParameter`.
-  Editable config would need the create-if-absent seeding pattern instead
-  (`SeedParameter` in the `derrops-account` repo); nothing here needs it yet.
+- Editable config and seeded credentials use the create-if-absent pattern
+  instead — `SeedParameter` in [`lib/seed-parameter.ts`](lib/seed-parameter.ts)
+  (mirrored from the `derrops-account` repo). It writes only when the parameter
+  is absent, so a value set out-of-band is never clobbered by a later deploy.
+- **`SecureString` parameters must go through `SeedParameter`.** CloudFormation's
+  `AWS::SSM::Parameter` does not support the type at all, so a direct SDK call is
+  the only way to create one. Whatever value is seeded reaches the template in
+  plaintext, so seed a placeholder and set the real secret out-of-band; a test
+  should assert the template carries only the placeholder.
 
 ## Per-stack source of truth
 
@@ -125,7 +132,7 @@ The only identifier that is *not* the convention name is the TypeScript **class*
 Don't duplicate region-wide singletons (e.g. the VPC) per stack. One stack **owns** the resource and exposes it (a `public readonly`); consumers receive it via props. `VpcStack` (`derrops--region--network`) owns the VPC and subnet arrays; `BastionStack` consumes them.
 
 - The owner exposes the resource for in-app consumers **and** publishes a discovery handle for out-of-app areas: an `ssmParam` named by the convention.
-- When a stack consumes another's resource, add an explicit `consumer.addDependency(owner)` in `bin/` so the owner deploys first — don't rely on the implicit reference alone.
+- When a stack consumes another's resource, add an explicit `consumer.addStackDependency(owner)` in `bin/` (`addDependency` is deprecated) so the owner deploys first — don't rely on the implicit reference alone.
 - Cross-**region** sharing is not a thing here: stacks in this app only ever reference resources in their own region. If you need something from another region, read it at runtime via the SDK with an explicit region.
 
 ## Adding a new stack
