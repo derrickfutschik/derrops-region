@@ -266,28 +266,31 @@ export class VpcStack extends cdk.Stack {
     // ── Discovery for out-of-app areas (SDK/CLI read at runtime) ────────────
     // Derived values that track the stack → plain StringParameters (not the
     // create-if-absent SeedParameter, which is for editable config).
-    const ids = (subnets: ec2.CfnSubnet[]) =>
-      cdk.Fn.join(',', subnets.map((s) => s.ref));
+    // The per-tier subnet ids are a list, so publish them as `StringList`
+    // parameters — the SSM SDK/CLI hands the reader back an array instead of a
+    // string they have to split. (CloudFormation still stores the underlying
+    // value comma-joined; the type is what makes it a list to consumers.)
+    const ids = (subnets: ec2.CfnSubnet[]) => subnets.map((s) => s.ref);
 
     new ssm.StringParameter(this, 'VpcIdParam', {
       parameterName: naming.name({ type: 'ssmParam', key: 'vpc-id' }),
       stringValue: this.vpc.ref,
       description: 'ID of the region VPC.',
     });
-    new ssm.StringParameter(this, 'PublicSubnetIdsParam', {
+    new ssm.StringListParameter(this, 'PublicSubnetIdsParam', {
       parameterName: naming.name({ type: 'ssmParam', key: 'subnet-ids', purpose: 'public' }),
-      stringValue: ids(this.publicSubnets),
-      description: 'Comma-separated IDs of the region VPC public subnets.',
+      stringListValue: ids(this.publicSubnets),
+      description: 'IDs of the region VPC public subnets.',
     });
-    new ssm.StringParameter(this, 'PrivateSubnetIdsParam', {
+    new ssm.StringListParameter(this, 'PrivateSubnetIdsParam', {
       parameterName: naming.name({ type: 'ssmParam', key: 'subnet-ids', purpose: 'private' }),
-      stringValue: ids(this.privateSubnets),
-      description: 'Comma-separated IDs of the region VPC private subnets.',
+      stringListValue: ids(this.privateSubnets),
+      description: 'IDs of the region VPC private subnets.',
     });
-    new ssm.StringParameter(this, 'IsolatedSubnetIdsParam', {
+    new ssm.StringListParameter(this, 'IsolatedSubnetIdsParam', {
       parameterName: naming.name({ type: 'ssmParam', key: 'subnet-ids', purpose: 'isolated' }),
-      stringValue: ids(this.isolatedSubnets),
-      description: 'Comma-separated IDs of the region VPC isolated subnets.',
+      stringListValue: ids(this.isolatedSubnets),
+      description: 'IDs of the region VPC isolated subnets.',
     });
     // Encode the "run the Tailscale relay here" recommendation as a concrete,
     // machine-readable pointer at the first public subnet.

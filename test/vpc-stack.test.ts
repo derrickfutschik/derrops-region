@@ -69,10 +69,16 @@ test('publishes discovery params, including the Tailscale relay subnet pointer',
   const template = synth();
   template.hasResourceProperties('AWS::SSM::Parameter', {
     Name: '/derrops/region/network/vpc-id',
+    Type: 'String',
   });
-  template.hasResourceProperties('AWS::SSM::Parameter', {
-    Name: '/derrops/region/network/subnet-ids/public',
-  });
+  // The per-tier subnet ids are published as StringList, not a String the
+  // reader has to split.
+  for (const tier of ['public', 'private', 'isolated']) {
+    template.hasResourceProperties('AWS::SSM::Parameter', {
+      Name: `/derrops/region/network/subnet-ids/${tier}`,
+      Type: 'StringList',
+    });
+  }
   // The recommendation ("run the Tailscale box in a public subnet") is encoded
   // as a concrete pointer, not just prose.
   template.hasResourceProperties('AWS::SSM::Parameter', {

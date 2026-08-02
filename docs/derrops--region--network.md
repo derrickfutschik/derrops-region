@@ -97,17 +97,23 @@ In-app consumers receive the VPC and subnet arrays by reference
 read SSM (runtime, SDK/CLI) — **always with an explicit `--region`**, since the
 same parameter names exist independently in every region you have deployed:
 
-| Parameter | Value |
-| --- | --- |
-| `/derrops/region/network/vpc-id` | VPC ID |
-| `/derrops/region/network/subnet-ids/public` | comma-separated public subnet IDs |
-| `/derrops/region/network/subnet-ids/private` | comma-separated private subnet IDs |
-| `/derrops/region/network/subnet-ids/isolated` | comma-separated isolated subnet IDs |
-| `/derrops/region/network/tailscale-relay-subnet-id` | recommended subnet for the Tailscale EC2 |
+| Parameter | Type | Value |
+| --- | --- | --- |
+| `/derrops/region/network/vpc-id` | `String` | VPC ID |
+| `/derrops/region/network/subnet-ids/public` | `StringList` | public subnet IDs |
+| `/derrops/region/network/subnet-ids/private` | `StringList` | private subnet IDs |
+| `/derrops/region/network/subnet-ids/isolated` | `StringList` | isolated subnet IDs |
+| `/derrops/region/network/tailscale-relay-subnet-id` | `String` | recommended subnet for the Tailscale EC2 |
 
 ```bash
 aws ssm get-parameter --region ap-southeast-2 \
   --name /derrops/region/network/vpc-id --query Parameter.Value --output text
+
+# StringList params come back as a JSON array from the SDK; the CLI still
+# renders the stored value comma-joined, so split it there.
+aws ssm get-parameter --region ap-southeast-2 \
+  --name /derrops/region/network/subnet-ids/private \
+  --query 'Parameter.Value' --output text | tr ',' '\n'
 ```
 
 ## Deploy-time configuration
