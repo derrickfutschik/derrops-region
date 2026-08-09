@@ -1,5 +1,12 @@
+# tsc emits next to its sources, so every .js here is build output — except the
+# few listed below, which are hand-written and must be committed. Anything added
+# to lib/ as real JavaScript needs its own negation, or it silently never lands
+# in a commit (and then never reaches a deploy).
 *.js
 !jest.config.js
+# The auto-stop Lambda handler, read verbatim into lambda.Code.fromInline by
+# lib/bastion-stack.ts. Source, not output — there is no bastion-auto-stop.ts.
+!lib/bastion-auto-stop.js
 *.d.ts
 node_modules
 

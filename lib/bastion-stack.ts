@@ -1,7 +1,13 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib/core';
 import { Construct } from 'constructs';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as logs from 'aws-cdk-lib/aws-logs';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { DerropsConventions } from 'derrops-conventions';
 import { SeedParameter } from './seed-parameter';
@@ -19,6 +25,32 @@ const PLATFORM_USER = { id: 'DerropsPlatform', name: 'derrops-platform' };
  * only when the parameter is absent, so replacing it out-of-band is permanent.
  */
 const PLACEHOLDER_SECRET = 'REPLACE-ME';
+
+/**
+ * When the bastion is powered off each day, expressed in the local time we
+ * actually care about (AEST) and the offset that converts it to the UTC an
+ * EventBridge rule needs.
+ *
+ * **AEST is fixed UTC+10** — the arithmetic below is deliberately offset-based,
+ * not zone-based, because an EventBridge *rule* cron is evaluated in UTC and has
+ * no timezone field at all (only the newer EventBridge *Scheduler* does). So
+ * during Sydney's daylight saving (AEDT, UTC+11) this fires at 05:00 local
+ * rather than 04:00. For "power the box off overnight" that hour is immaterial;
+ * if it ever matters, move the schedule to `scheduler.CfnSchedule` with
+ * `ScheduleExpressionTimezone: 'Australia/Sydney'`.
+ *
+ * Region-independent by construction: the cron is UTC, so the same template is
+ * correct in every region this stack is deployed to.
+ */
+const STOP_HOUR_AEST = 4;
+const AEST_UTC_OFFSET_HOURS = 10;
+const STOP_HOUR_UTC = (STOP_HOUR_AEST - AEST_UTC_OFFSET_HOURS + 24) % 24;
+
+/**
+ * The auto-stop Lambda's source, next to this file so an editor treats it as
+ * the JavaScript it is. Read verbatim into `lambda.Code.fromInline` below.
+ */
+const AUTO_STOP_HANDLER_FILE = 'bastion-auto-stop.js';
 
 /**
  * Design-time naming segments for the bastion stack. Every resource name, the
@@ -55,6 +87,14 @@ export interface BastionStackProps extends cdk.StackProps {
    * @default 't4g.nano'
    */
   readonly instanceType?: string;
+
+  /**
+   * When the daily auto-stop Lambda runs. **The expression is evaluated in
+   * UTC** — an EventBridge rule cron has no timezone.
+   *
+   * @default 04:00 AEST (`cron(0 18 * * ? *)`, i.e. 18:00 UTC)
+   */
+  readonly autoStopSchedule?: events.Schedule;
 }
 
 /**
@@ -88,6 +128,25 @@ export interface BastionStackProps extends cdk.StackProps {
  *     VPC's own CIDR**, so in-VPC hosts (and tailnet peers arriving via the
  *     Tailscale subnet router) can reach the box on its private IP. Egress is
  *     unrestricted.
+ *
+ * ## Automatic shutdown
+ *
+ * An EventBridge rule fires a small Lambda at **04:00 AEST every day**, which
+ * calls `ec2:StopInstances` on this instance and nothing else. Stopping is the
+ * cost lever (see `scripts/bastion-stop.sh`): stopped, the box bills only its
+ * EBS root volume and its idle Elastic IP, and its instance id, address,
+ * security group and SSM parameters all survive. Start it again with
+ * `scripts/bastion-start.sh`; note the Lambda cannot reverse that — a box left
+ * running is off again by the next morning, and anything brought up by hand on
+ * it (Tailscale) needs bringing up again.
+ *
+ * Two SSM parameters go with it. `.../auto-stop/enabled` is a **runtime kill
+ * switch**: the rule always fires, but the Lambda reads this first and skips
+ * the stop unless it is `'true'`. It is seeded, not managed, so setting it to
+ * `false` for an overnight job survives every later deploy — and nothing sets
+ * it back for you. `.../auto-stop/schedule` is the opposite: read-only, taken
+ * off the same `events.Schedule` the rule was built from so the two cannot
+ * drift.
  */
 export class BastionStack extends cdk.Stack {
   /** The bastion EC2 instance — consumers receive it by reference. */
@@ -222,6 +281,141 @@ export class BastionStack extends cdk.Stack {
     new ec2.CfnEIPAssociation(this, 'BastionEipAssociation', {
       allocationId: eip.attrAllocationId,
       instanceId: this.instance.ref,
+    });
+
+    // ── Daily auto-stop (04:00 AEST) ────────────────────────────────────────
+    // The instance is only ever wanted while someone is using it, and the one
+    // failure mode that costs real money is forgetting to stop it. A rule + a
+    // Lambda that calls StopInstances makes "off" the resting state without
+    // touching anything that must survive — stopping preserves the instance id,
+    // the EIP association, the security group and every SSM parameter above.
+    //
+    // The Lambda is deliberately one-directional: it never starts the box. That
+    // is what makes it safe to run unattended — the worst it can do is stop
+    // something already stopped, which the API treats as a no-op.
+    const autoStopSchedule =
+      props.autoStopSchedule ??
+      events.Schedule.cron({ minute: '0', hour: String(STOP_HOUR_UTC) });
+
+    // The kill switch. Seeded (create-if-absent) rather than CloudFormation-
+    // managed, so flipping it to 'false' in the console survives every later
+    // deploy — that is the whole point of a switch you reach for at 2am. The
+    // *rule* always fires; the lambda reads this on each run and skips the stop
+    // when it is not 'true'. Gating in the lambda rather than on the rule's
+    // State keeps the toggle a runtime edit instead of a deploy.
+    const autoStopEnabledParamName = naming.name({
+      type: 'ssmParam',
+      key: 'auto-stop',
+      purpose: 'enabled',
+    });
+    new SeedParameter(this, 'BastionAutoStopEnabledParam', {
+      parameterName: autoStopEnabledParamName,
+      value: 'true',
+      description:
+        "Whether the daily bastion auto-stop runs. Set to 'false' to suspend it without a deploy (any other value also suspends it); 'true' to resume. Seeded once — never re-asserted by a deploy. If the parameter is deleted the stop still runs.",
+    });
+
+    const autoStopLogGroup = new logs.LogGroup(this, 'BastionAutoStopLogGroup', {
+      // Lambda would otherwise create /aws/lambda/<fn-name> itself, with
+      // retention set to never expire. Naming it here puts it under the same
+      // convention as everything else and bounds what it keeps.
+      logGroupName: naming.name({ type: 'cloudwatchLogsGroup', key: 'auto-stop' }),
+      retention: logs.RetentionDays.ONE_MONTH,
+      // Nothing here is worth keeping after the stack goes: one line per day
+      // recording a state transition that EC2 itself already knows about.
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const autoStopFn = new lambda.Function(this, 'BastionAutoStopFunction', {
+      // Lambda function names are region-scoped, so the convention name is safe
+      // to repeat per region — unlike the role above, which stays unnamed.
+      functionName: naming.name({ type: 'lambdaFunction', key: 'auto-stop' }),
+      runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64 for the same reason the instance is Graviton: cheaper per ms.
+      architecture: lambda.Architecture.ARM_64,
+      handler: 'index.handler',
+      timeout: cdk.Duration.seconds(30),
+      logGroup: autoStopLogGroup,
+      environment: {
+        // The instance id is passed rather than looked up: it is right here in
+        // this stack, so a runtime read would only add a failure mode. The
+        // enabled flag is the opposite — its whole value is being editable
+        // between deploys, so only its *name* can be baked in.
+        INSTANCE_ID: this.instance.ref,
+        ENABLED_PARAM: autoStopEnabledParamName,
+      },
+      // Inline, not a bundled asset: the whole function is two API calls, and
+      // the AWS SDK v3 ships in the Node.js runtime, so there is nothing to
+      // build. It stays readable in the synthesized template and in the console.
+      //
+      // The source is a real `.js` file rather than a string literal here, so
+      // an editor highlights and checks it and its decision logic has its own
+      // unit test (`test/bastion-auto-stop.test.ts`) — it is read verbatim, so
+      // what runs in Lambda is exactly what that test exercises. `fromInline`
+      // caps the code at 4 KB; a test asserts the file still fits.
+      code: lambda.Code.fromInline(
+        fs.readFileSync(path.join(__dirname, AUTO_STOP_HANDLER_FILE), 'utf8'),
+      ),
+    });
+
+    // Exactly one action on exactly one instance — the ARN is built from this
+    // stack's own region/account, so the grant cannot reach a box elsewhere.
+    autoStopFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['ec2:StopInstances'],
+        resources: [
+          this.formatArn({
+            service: 'ec2',
+            resource: 'instance',
+            resourceName: this.instance.ref,
+            arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
+          }),
+        ],
+      }),
+    );
+    // Read-only, and only the switch — not the whole parameter tree. The
+    // credentials parameters live under sibling paths in the same account.
+    autoStopFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['ssm:GetParameter'],
+        resources: [
+          this.formatArn({
+            service: 'ssm',
+            resource: 'parameter',
+            resourceName: autoStopEnabledParamName.replace(/^\//, ''),
+            arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
+          }),
+        ],
+      }),
+    );
+
+    // The rule is **always enabled** — `enabled` is left at its default `true`
+    // and nothing here can turn it off. It fires every day regardless of the
+    // switch; the lambda re-reads `.../auto-stop/enabled` on each invocation
+    // and decides then. Suspending the stop is therefore a live SSM edit, with
+    // no deploy and no drift between the rule's State and the parameter.
+    new events.Rule(this, 'BastionAutoStopRule', {
+      ruleName: naming.name({ type: 'eventBridgeRule', key: 'auto-stop' }),
+      description: `Stop the bastion daily at ${STOP_HOUR_AEST}:00 AEST (${STOP_HOUR_UTC}:00 UTC), unless ${autoStopEnabledParamName} says otherwise.`,
+      // Cron fields not given default to '*', except day-of-week, which
+      // EventBridge requires as '?' when day-of-month is '*' — Schedule.cron
+      // fills that in. Result: cron(0 18 * * ? *).
+      schedule: autoStopSchedule,
+      targets: [new targets.LambdaFunction(autoStopFn)],
+    });
+
+    // The schedule, published so it can be read without a `cdk synth` or an
+    // events:DescribeRule call. CloudFormation-managed and taken off the very
+    // same Schedule object the rule above was built from, so it tracks the
+    // stack and cannot drift — unlike `.../enabled`, editing this changes
+    // nothing (EventBridge owns the schedule; change `autoStopSchedule` and
+    // deploy). Its description says so, since whoever opens it in the console
+    // is exactly who might otherwise assume it is a dial.
+    new ssm.StringParameter(this, 'BastionAutoStopScheduleParam', {
+      parameterName: naming.name({ type: 'ssmParam', key: 'auto-stop', purpose: 'schedule' }),
+      stringValue: autoStopSchedule.expressionString,
+      description:
+        `EventBridge schedule for the daily bastion auto-stop — evaluated in UTC (${STOP_HOUR_UTC}:00 UTC = ${STOP_HOUR_AEST}:00 AEST). Read-only: published by the stack, so editing it does not change when the stop runs.`,
     });
 
     // ── Discovery for out-of-app areas (SDK/CLI read at runtime) ────────────

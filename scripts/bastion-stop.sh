@@ -9,7 +9,11 @@
 # box back.
 #
 #   ./scripts/bastion-stop.sh ap-southeast-2
-#   ./scripts/bastion-stop.sh ap-southeast-2 --wait
+#   ./scripts/bastion-stop.sh ap-southeast-2 --no-wait
+#
+# By default it polls until the instance reaches 'stopped', so a successful exit
+# means billing for the instance has actually ceased. `--no-wait` returns as
+# soon as the stop is accepted.
 #
 # The region defaults to ap-southeast-2 when omitted. Note that this differs
 # from the `cdk` commands in this repo, which never default: the bastion's SSM
@@ -46,13 +50,15 @@ Arguments:
 Options:
   -i, --instance-id <id>  Target this instance instead of the one published at
                           /derrops/region/bastion/instance-id.
-  -w, --wait              Block until the instance reaches 'stopped' instead of
-                          returning as soon as the stop is accepted.
+  -w, --wait              Block until the instance reaches 'stopped'. This is
+                          the default; the flag is accepted for explicitness.
+  -n, --no-wait           Return as soon as the stop is accepted, without
+                          polling for 'stopped'.
   -h, --help              Show this help.
 
 Examples:
   ./scripts/bastion-stop.sh ap-southeast-2
-  ./scripts/bastion-stop.sh ap-southeast-2 --wait
+  ./scripts/bastion-stop.sh ap-southeast-2 --no-wait
 EOF
 }
 
@@ -63,7 +69,9 @@ die() {
 
 region=''
 instance_id=''
-wait_for_state='false'
+# Waiting is the default: 'stop accepted' is not 'stopped', and the useful
+# confirmation is that the instance actually got there. --no-wait opts out.
+wait_for_state='true'
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -78,6 +86,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -w|--wait)
       wait_for_state='true'
+      shift
+      ;;
+    -n|--no-wait)
+      wait_for_state='false'
       shift
       ;;
     -*)

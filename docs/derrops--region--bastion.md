@@ -120,6 +120,108 @@ One thing does not survive a stop/start cycle:
   again after the box comes back — and while it is stopped, any routes it
   advertises are gone from the tailnet.
 
+## Automatic shutdown (04:00 AEST daily)
+
+You do not have to remember to run `bastion-stop.sh`. The stack schedules the
+stop itself, so **off is the resting state** and the expensive failure mode —
+leaving the box running for a week — cannot happen:
+
+| Resource | Name | What it is |
+| --- | --- | --- |
+| EventBridge rule | `derrops--region--bastion--auto-stop` | `cron(0 18 * * ? *)` — fires once a day, **always enabled** |
+| Lambda function | `derrops--region--bastion--auto-stop` | Node.js 22, arm64, inline; checks the switch, then `ec2:StopInstances` |
+| Log group | `/derrops/region/bastion/auto-stop` | 30-day retention (Lambda's own default never expires) |
+
+It is deliberately **one-directional** — the Lambda never *starts* the instance.
+That is what makes it safe to run unattended: the worst it can do is stop a box
+that is already stopped, which EC2 treats as a no-op. Start the bastion yourself
+with `./scripts/bastion-start.sh` whenever you need it; expect it to be off
+again by the next morning, along with anything you brought up by hand on it.
+
+Its IAM grant is two actions, each scoped to one ARN in this account and region:
+`ec2:StopInstances` on this instance, and `ssm:GetParameter` on the switch below
+— never `*`, never a path wildcard (the `SecureString` credentials sit under
+sibling paths), and never a start or terminate action. Tests assert all of that,
+since this is the one thing here that runs with nobody watching.
+
+### The two SSM parameters
+
+| Parameter | Value | Editable? |
+| --- | --- | --- |
+| `/derrops/region/bastion/auto-stop/enabled` | `true` | **Yes** — the kill switch, read on every run |
+| `/derrops/region/bastion/auto-stop/schedule` | `cron(0 18 * * ? *)` | No — published by the stack |
+
+**`enabled`** is a real runtime switch:
+
+1. The rule is **always enabled** — nothing in the stack turns it off — so it
+   fires every day at 18:00 UTC no matter what.
+2. Each firing invokes the Lambda, which **re-reads this parameter first** and
+   returns without touching EC2 unless the value is `true` (case- and
+   whitespace-insensitive; any other value suspends the stop).
+
+Gating in the Lambda rather than on the rule's `State` is what makes suspending
+it a live edit instead of a deploy — and means there is no second place that can
+disagree about whether auto-stop is on. Suspend it — for an overnight job, a
+migration, a debugging session — with:
+
+```bash
+aws ssm put-parameter --region ap-southeast-2 \
+  --name /derrops/region/bastion/auto-stop/enabled \
+  --type String --overwrite --value false
+```
+
+It goes through [`SeedParameter`](../lib/seed-parameter.ts) rather than being
+CloudFormation-managed, for the same reason the credentials do: `Overwrite:
+false` means it is written once and never re-asserted, so a `false` you set at
+2am survives every later `cdk deploy`. **Remember to set it back** — nothing
+re-enables it for you. If the parameter is deleted entirely the stop still runs:
+the stack seeds it `true`, so absence means the switch is gone, not off.
+
+**`schedule`** is the opposite — a read-only descriptor, so the cron can be read
+without a `cdk synth` or an `events:DescribeRule` call. Its value is taken off
+the very same `events.Schedule` object the rule is built from, so the two cannot
+drift; a test asserts it follows an overridden `autoStopSchedule`. Editing it
+changes nothing — EventBridge owns the schedule, so change the
+`autoStopSchedule` prop and deploy.
+
+### Why 18:00 UTC, and what daylight saving does
+
+An **EventBridge rule** cron is evaluated in UTC and has no timezone field at
+all, so the schedule is stated as UTC and derived in
+[`lib/bastion-stack.ts`](../lib/bastion-stack.ts) from two constants:
+`STOP_HOUR_AEST = 4` and `AEST_UTC_OFFSET_HOURS = 10` → 18:00 UTC. Being UTC, the
+same expression is correct in **every** region this stack is deployed to.
+
+AEST is fixed UTC+10, so during Sydney's daylight saving (AEDT, UTC+11) this
+fires at **05:00 local** rather than 04:00. For "power the box off overnight"
+that hour is immaterial. If it ever matters, the fix is to move the schedule off
+an EventBridge *rule* onto EventBridge **Scheduler** (`scheduler.CfnSchedule`),
+which does take `ScheduleExpressionTimezone: 'Australia/Sydney'` and follows
+the zone's DST transitions.
+
+To change the timing, pass a different `autoStopSchedule` (see the props table
+below); to suspend the stop without a deploy, use the `enabled` switch above.
+
+### Where the handler lives
+
+The Lambda's source is a real file —
+[`lib/bastion-auto-stop.js`](../lib/bastion-auto-stop.js) — not a string literal
+inside the stack. `BastionStack` reads it **verbatim** into
+`lambda.Code.fromInline`, so an editor highlights and checks it, and what runs
+in AWS is byte-for-byte what the repo holds (a test asserts the template's
+`ZipFile` equals the file, and that it stays under `fromInline`'s 4 KB cap).
+
+It stays inline rather than becoming a `fromAsset` bundle because the whole
+function is two API calls and the AWS SDK v3 ships in the Node.js runtime —
+there is nothing to build, and the code stays readable in the console and in
+`cdk diff`.
+
+Its decision logic takes the two AWS calls as injected functions, so
+[`test/bastion-auto-stop.test.ts`](../test/bastion-auto-stop.test.ts) exercises
+it with plain stubs — no SDK dependency, no mocking framework. That is where the
+switch semantics are pinned: `'true'` stops, anything else skips, a *deleted*
+parameter still stops, and any other SSM error is raised rather than swallowed.
+
 ## Discovery
 
 In-app consumers receive the `instance` by reference. Out-of-app areas read SSM
@@ -133,6 +235,8 @@ In-app consumers receive the `instance` by reference. Out-of-app areas read SSM
 | `/derrops/region/bastion/public-ip` | The Elastic IP — stable public address, but nothing inbound is open to it |
 | `/derrops/region/bastion/eip-allocation-id` | Allocation ID of the Elastic IP (for re-association) |
 | `/derrops/region/bastion/security-group-id` | The security group, to reference as a source in another group's rules |
+| `/derrops/region/bastion/auto-stop/enabled` | Kill switch for the daily auto-stop — **editable** (see above) |
+| `/derrops/region/bastion/auto-stop/schedule` | The auto-stop cron, in UTC — read-only |
 
 Each is named for exactly what it holds. There is deliberately **no generic
 `host` or `endpoint` parameter** — which address is the right one is not a
@@ -305,6 +409,7 @@ aws ssm get-parameter --region ap-southeast-2 \
 | `vpc` | — (required) | The region's VPC (`VpcStack.vpc`) |
 | `publicSubnets` | — (required) | Public subnets (`VpcStack.publicSubnets`); the bastion lands in the first |
 | `instanceType` | `t4g.nano` | Must stay an **arm64/Graviton** type to match the AMI |
+| `autoStopSchedule` | 04:00 AEST — `cron(0 18 * * ? *)` | An `events.Schedule`; **evaluated in UTC** (a rule cron has no timezone) |
 
 Depends on [`derrops--region--network`](derrops--region--network.md) (consumes
 its VPC + public subnets, so it deploys after it). The region comes from

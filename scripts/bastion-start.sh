@@ -7,7 +7,11 @@
 # re-registered. Nothing is redeployed.
 #
 #   ./scripts/bastion-start.sh ap-southeast-2
-#   ./scripts/bastion-start.sh ap-southeast-2 --wait
+#   ./scripts/bastion-start.sh ap-southeast-2 --no-wait
+#
+# By default it polls until the instance is running *and* its SSM agent is
+# online, so a successful exit means `bastion-session.sh` will connect.
+# `--no-wait` returns as soon as the start is accepted.
 #
 # The region defaults to ap-southeast-2 when omitted. Note that this differs
 # from the `cdk` commands in this repo, which never default: the bastion's SSM
@@ -47,12 +51,15 @@ Options:
                           /derrops/region/bastion/instance-id.
   -w, --wait              Block until the instance is running *and* its SSM
                           agent has re-registered, i.e. until
-                          bastion-session.sh will actually connect.
+                          bastion-session.sh will actually connect. This is the
+                          default; the flag is accepted for explicitness.
+  -n, --no-wait           Return as soon as the start is accepted, without
+                          polling for 'running' or for the SSM agent.
   -h, --help              Show this help.
 
 Examples:
   ./scripts/bastion-start.sh ap-southeast-2
-  ./scripts/bastion-start.sh ap-southeast-2 --wait
+  ./scripts/bastion-start.sh ap-southeast-2 --no-wait
 EOF
 }
 
@@ -63,7 +70,9 @@ die() {
 
 region=''
 instance_id=''
-wait_for_state='false'
+# Waiting is the default: the useful end state is 'connectable', not 'start
+# accepted'. --no-wait opts out.
+wait_for_state='true'
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -78,6 +87,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -w|--wait)
       wait_for_state='true'
+      shift
+      ;;
+    -n|--no-wait)
+      wait_for_state='false'
       shift
       ;;
     -*)

@@ -154,6 +154,18 @@ export class VpcStack extends cdk.Stack {
     const azSuffixes =
       props.availabilityZoneSuffixes ?? ['a', 'b', 'c'].map((l) => `${azGroup}${l}`);
 
+    // Template validation warns (W3010) about the literal AZ names on the
+    // subnets below. Its advice — `Fn::GetAZs` or an AZ parameter — is wrong for
+    // this stack: array position in `azSuffixes` *is* the CIDR slot, so a subnet
+    // must land in the same zone on every deploy, and `Fn::GetAZs` returns an
+    // order AWS does not guarantee (it would silently re-shuffle CIDRs across
+    // zones). The names are still region-derived, never hardcoded in source.
+    cdk.Validations.of(this).acknowledge({
+      id: 'CloudFormation-Validate::W3010',
+      reason:
+        'Subnet AZ names are derived from the stack region and deliberately pinned per CIDR slot.',
+    });
+
     // Full name + stable-CIDR plan for the whole VPC. `subnet` is a naming-only
     // convention Resource, but building it currently requires an ARN context
     // (see TODO(topology-resource-arn) upstream) — the account id is never used
