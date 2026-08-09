@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 import * as cdk from 'aws-cdk-lib/core';
 import { VpcStack, naming as vpcNaming } from '../lib/vpc-stack';
-import { BastionStack, naming as bastionNaming } from '../lib/bastion-stack';
+import {
+  BastionStack,
+  amiParameterName,
+  naming as bastionNaming,
+} from '../lib/bastion-stack';
+import { ensureAmiParameter } from '../lib/ensure-ami-parameter';
 
 const app = new cdk.App();
 
@@ -49,4 +54,38 @@ const bastion = new BastionStack(
 );
 bastion.addStackDependency(vpc);
 
-app.synth();
+// ── Seed the bastion's AMI pin, if this region has never had one ────────────
+// The one piece of setup that cannot live in a stack: `BastionStack` reads the
+// AMI as an `AWS::SSM::Parameter::Value<>`, and CloudFormation resolves those
+// before it touches any resource, so the parameter has to exist before the
+// deploy starts. This is create-if-absent and reads AWS's latest-AL2023-arm64
+// pointer for the default, so a brand-new region just works and an existing
+// pin — including one edited by hand — is never disturbed.
+//
+// Failures are reported and swallowed on purpose. This runs on every `cdk`
+// command, including `list` and `synth`, which must keep working without
+// credentials; if the parameter really is missing the deploy fails on its own,
+// loudly, before changing anything.
+//
+// Awaited rather than fired off: the CDK CLI moves straight from this process
+// to the deploy, so the seed has to have landed by the time synth returns.
+async function main(): Promise<void> {
+  try {
+    const { action, amiId } = await ensureAmiParameter(region, amiParameterName);
+    if (action === 'seeded') {
+      console.error(
+        `Seeded ${amiParameterName} in ${region} with ${amiId} (latest AL2023 arm64).`,
+      );
+    }
+  } catch (err: unknown) {
+    console.error(
+      `Warning: could not ensure ${amiParameterName} in ${region}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+
+  app.synth();
+}
+
+void main();

@@ -15,7 +15,7 @@ sessions possible.
 | Aspect | Choice | Why |
 | --- | --- | --- |
 | Instance type | `t4g.nano` (override via `instanceType`) | Cheapest current-gen; ample for a WireGuard relay |
-| AMI | Amazon Linux 2023 **arm64** (latest, via AWS-owned SSM param) | `t4g` is Graviton (arm64); AL2023 ships the SSM agent. Resolved at deploy time, so it is correct in every region automatically |
+| AMI | Amazon Linux 2023 **arm64**, **pinned** at `/derrops/region/bastion/ami-id` | `t4g` is Graviton (arm64); AL2023 ships the SSM agent. Read at deploy time from a parameter you own, per region — never AWS's floating "latest" pointer, which replaces the instance whenever it moves (see below) |
 | Subnet | `publicSubnets[0]` from `VpcStack` | Free IGW egress reaches the SSM (and later Tailscale) endpoints — no NAT Gateway; public IPv4 (~$3.6/mo) also aids Tailscale NAT traversal |
 | Public address | **Elastic IP**, associated with the instance | Stable across stop/start, so the address can be pinned (DNS, an allow-list elsewhere, a Tailscale peer endpoint). Published to SSM as `.../endpoint` |
 
@@ -26,6 +26,115 @@ The EIP replaces the subnet's auto-assigned public IPv4 rather than adding to
 it, so a *running* bastion costs the same one address either way. It does keep
 billing (~$3.6/mo) while the instance is **stopped**, since an unassociated
 Elastic IP is charged as idle — that is the price of the address staying put.
+
+## Not losing the box
+
+The bastion is the only thing in this repo whose contents cannot be rebuilt
+from the repo — Tailscale is brought up on it **by hand** — so it is the only
+resource that must not be allowed to vanish in a routine deploy. Two guards
+exist, added after a deploy did exactly that.
+
+### What went wrong on 2026-08-09
+
+A deploy that touched nothing about the instance terminated
+`i-0f2022ddf0410d02b` (created Jul 28) and created `i-0a946bfd58e572b0a`.
+The stack event was `Requested update requires the creation of a new physical
+resource`.
+
+The cause was the AMI. The stack used
+`MachineImage.latestAmazonLinux2023()`, which emits a CloudFormation parameter
+pointing at AWS's public *newest AL2023* pointer
+(`/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64`), re-resolved
+on **every** deploy. AWS republished it in the twelve days since the box was
+created, `ImageId` is a replacement property on `AWS::EC2::Instance`, and so the
+deploy rebuilt the box. Every AL2023 release armed the next deploy to do it
+again.
+
+(The security group was the other suspect and is innocent: it was replaced on
+Jul 29 and the instance recorded a plain in-place `UPDATE_COMPLETE`. Swapping
+`SecurityGroupIds` on a VPC instance really is a no-interruption update.)
+
+### 1. The AMI is pinned in SSM
+
+| | |
+| --- | --- |
+| Parameter | `/derrops/region/bastion/ami-id` |
+| Current value | `ami-0a036c1f3ca5d1f73` (`al2023-ami-2023.12.20260803.3-kernel-6.1-arm64`) |
+| Seeded with | The latest AL2023 arm64 image, **once**, on the first `cdk` run in a region |
+| Changed by | **You**, and nothing else. No deploy ever re-asserts it |
+
+`BastionStack` reads it as an `AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>`
+stack parameter, so the value resolves at deploy time and stays region-portable
+— the same parameter name in another region names that region's own image.
+Nothing moves it but you, so a deploy no longer decides for itself what the box
+should be running.
+
+Upgrading is now a deliberate act: overwrite the parameter, then deploy.
+
+```bash
+aws ssm put-parameter --region ap-southeast-2 \
+  --name /derrops/region/bastion/ami-id \
+  --type String --overwrite --value ami-0123456789abcdef0
+npx cdk deploy --all -c region=ap-southeast-2
+```
+
+That deploy **replaces the instance** — which is the point of doing it on
+purpose. Anything set up by hand on the box (Tailscale) has to be set up again.
+To find the current AL2023 arm64 image for a region:
+
+```bash
+aws ssm get-parameter --region ap-southeast-2 \
+  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64 \
+  --query Parameter.Value --output text
+```
+
+Whatever you pin must be **arm64** — `t4g` is Graviton. Nothing in the stack can
+check that; a mismatch fails at launch.
+
+#### Where the first value comes from
+
+A new region needs no preparation: the parameter defaults to the latest AL2023
+arm64 image, seeded on the first `cdk` command run against that region.
+
+The seeding lives in [`bin/region-bootstrap.ts`](../bin/region-bootstrap.ts)
+(logic in [`lib/ensure-ami-parameter.ts`](../lib/ensure-ami-parameter.ts)), which
+is the **only** thing in this repo that touches AWS outside a stack. That is
+forced, not chosen: CloudFormation resolves `AWS::SSM::Parameter::Value<>` stack
+parameters **before it touches any resource**, so a stack cannot create the
+parameter it also reads — the read happens first and the deploy fails. Ahead of
+synth is the only place left.
+
+What it does, on every `cdk` command:
+
+1. Read `/derrops/region/bastion/ami-id` in the target region. **Present → stop.**
+   An existing pin, however it got there, is never disturbed.
+2. Absent → read AWS's public `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64`
+   for that region and write it, with `Overwrite: false`.
+
+Its decision logic is unit-tested with stub SSM operations
+([`test/ensure-ami-parameter.test.ts`](../test/ensure-ami-parameter.test.ts)) —
+the case that matters being *existing pin plus newer image available* → nothing
+written.
+
+Failures here are printed and swallowed: `cdk list` and `cdk synth` have to keep
+working without credentials. If the parameter genuinely does not exist, the
+deploy fails on its own with `Parameters [/derrops/region/bastion/ami-id] do not
+exist in the Parameter Store`, before changing anything.
+
+### 2. Termination protection
+
+The instance carries `DisableApiTermination` (`instanceTerminationProtection`,
+default `true`). The pinned AMI removes the *known* cause of a replacement; this
+catches the next one — a subnet change, an instance-type change, a replacement
+property added later.
+
+| | |
+| --- | --- |
+| The existing box **survives** | EC2 refuses the terminate. Whatever you set up on it is still there |
+| The replacement still **happens** | CloudFormation creates a new instance and repoints the EIP and every SSM parameter at it, then fails to delete the old one |
+| The old box becomes an **orphan** | Still running, still billing, no longer in the stack. That failed delete is the alarm — get what you need off it and terminate it by hand |
+| Stop/start is **unaffected** | Including the daily auto-stop, which only ever calls `StopInstances` |
+| `cdk destroy` **blocks** | Pass `instanceTerminationProtection: false` and deploy first, or clear the attribute live: `aws ec2 modify-instance-attribute --region ap-southeast-2 --instance-id <id> --no-disable-api-termination` (the next deploy re-asserts it) |
 
 ## The IAM role is deliberately unnamed
 
@@ -237,6 +346,7 @@ In-app consumers receive the `instance` by reference. Out-of-app areas read SSM
 | `/derrops/region/bastion/security-group-id` | The security group, to reference as a source in another group's rules |
 | `/derrops/region/bastion/auto-stop/enabled` | Kill switch for the daily auto-stop — **editable** (see above) |
 | `/derrops/region/bastion/auto-stop/schedule` | The auto-stop cron, in UTC — read-only |
+| `/derrops/region/bastion/ami-id` | The pinned AMI — **an input**, not an output: seeded once with the latest AL2023 arm64, then yours to change; the stack only reads it (see above) |
 
 Each is named for exactly what it holds. There is deliberately **no generic
 `host` or `endpoint` parameter** — which address is the right one is not a
@@ -410,11 +520,21 @@ aws ssm get-parameter --region ap-southeast-2 \
 | `publicSubnets` | — (required) | Public subnets (`VpcStack.publicSubnets`); the bastion lands in the first |
 | `instanceType` | `t4g.nano` | Must stay an **arm64/Graviton** type to match the AMI |
 | `autoStopSchedule` | 04:00 AEST — `cron(0 18 * * ? *)` | An `events.Schedule`; **evaluated in UTC** (a rule cron has no timezone) |
+| `instanceTerminationProtection` | `true` | EC2 `DisableApiTermination` (see above). Set `false` before `cdk destroy`. Not `terminationProtection` — `cdk.StackProps` owns that name for protecting the *stack* |
+| `amiId` | read from `/derrops/region/bastion/ami-id` | Pins the AMI in source instead. Leave unset — an id here is a different image, or none, in the next region. For tests and one-off recovery |
 
 Depends on [`derrops--region--network`](derrops--region--network.md) (consumes
 its VPC + public subnets, so it deploys after it). The region comes from
-`-c region=<aws-region>`.
+`-c region=<aws-region>`. `/derrops/region/bastion/ami-id` is seeded
+automatically in a region that has never had one (see above).
 
 ```bash
 npx cdk deploy --all -c region=ap-southeast-2
+```
+
+Check what a deploy would do to the instance before running it — `ImageId` and
+`SubnetId` changes are the ones that replace the box:
+
+```bash
+npx cdk diff -c region=ap-southeast-2
 ```

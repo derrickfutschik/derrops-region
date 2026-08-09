@@ -60,6 +60,59 @@ test('instanceType is overridable', () => {
   template.hasResourceProperties('AWS::EC2::Instance', { InstanceType: 't4g.micro' });
 });
 
+// The regression this pins: the AMI must come from *our* parameter, not from
+// AWS's public 'latest AL2023' pointer. That pointer moves whenever AWS
+// publishes an image, and a changed ImageId replaces the instance — which is
+// how the hand-configured box was lost on 2026-08-09.
+test('takes its AMI from the pinned SSM parameter, not a floating pointer', () => {
+  const template = synth();
+  const params = template.toJSON().Parameters ?? {};
+  const amiParams = Object.entries<{ Type: string; Default: string }>(params).filter(
+    ([, p]) => p.Type === 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>',
+  );
+  expect(amiParams).toHaveLength(1);
+  expect(amiParams[0]![1].Default).toBe('/derrops/region/bastion/ami-id');
+  // ...and the instance actually uses it.
+  template.hasResourceProperties('AWS::EC2::Instance', {
+    ImageId: { Ref: amiParams[0]![0] },
+  });
+});
+
+// The parameter is written by hand, per region — the stack must never create
+// or re-assert it, or a deploy would put the image back to whatever source
+// says and replace the instance all over again.
+test('does not manage the AMI parameter itself', () => {
+  const template = synth();
+  const managed = Object.values<{ Properties?: { Name?: string } }>(
+    template.toJSON().Resources ?? {},
+  ).filter((r) => r.Properties?.Name === '/derrops/region/bastion/ami-id');
+  expect(managed).toHaveLength(0);
+});
+
+test('amiId overrides the parameter when given', () => {
+  const template = synth({ amiId: 'ami-0a036c1f3ca5d1f73' });
+  template.hasResourceProperties('AWS::EC2::Instance', {
+    ImageId: 'ami-0a036c1f3ca5d1f73',
+  });
+});
+
+// The box is hand-configured (Tailscale), so a replacement — from any property,
+// not just the AMI — loses everything on it. Protection is the backstop.
+test('has termination protection on by default', () => {
+  const template = synth();
+  template.hasResourceProperties('AWS::EC2::Instance', {
+    DisableApiTermination: true,
+  });
+});
+
+// Has to be switchable, or `cdk destroy` can never delete the instance.
+test('termination protection is overridable', () => {
+  const template = synth({ instanceTerminationProtection: false });
+  template.hasResourceProperties('AWS::EC2::Instance', {
+    DisableApiTermination: false,
+  });
+});
+
 test('lands in the provided public subnet', () => {
   const template = synth();
   template.hasResourceProperties('AWS::EC2::Instance', {

@@ -69,6 +69,14 @@ export const naming = new DerropsConventions({
   service: 'bastion',
 }).tagPrefix('derrops:');
 
+/**
+ * The AMI the bastion is built from, held in SSM per region and read at deploy
+ * time. Exported because `bin/` seeds it before synth — see
+ * [`ensureAmiParameter`](ensure-ami-parameter.ts) for why that cannot happen
+ * inside this stack.
+ */
+export const amiParameterName = naming.name({ type: 'ssmParam', key: 'ami-id' });
+
 export interface BastionStackProps extends cdk.StackProps {
   /** The region's VPC (from `VpcStack`) the bastion launches into. */
   readonly vpc: ec2.CfnVPC;
@@ -95,6 +103,38 @@ export interface BastionStackProps extends cdk.StackProps {
    * @default 04:00 AEST (`cron(0 18 * * ? *)`, i.e. 18:00 UTC)
    */
   readonly autoStopSchedule?: events.Schedule;
+
+  /**
+   * AMI for the bastion, pinned in source rather than read from SSM.
+   *
+   * Leave it unset. The default reads `.../bastion/ami-id` **in the region
+   * being deployed**, which is the only pin that stays region-portable — an id
+   * written here would be a different image, or nothing at all, in the next
+   * region. This exists for tests and for a one-off recovery when the parameter
+   * is unreachable.
+   *
+   * @default the AMI id held at `/derrops/region/bastion/ami-id`
+   */
+  readonly amiId?: string;
+
+  /**
+   * EC2 termination protection (`DisableApiTermination`) on the bastion. On by
+   * default: this box is configured **by hand** (Tailscale), so nothing it
+   * holds can be rebuilt from this repo, and a deploy that quietly terminates
+   * it is unrecoverable.
+   *
+   * Named `instanceTerminationProtection`, not `terminationProtection` —
+   * `cdk.StackProps` already defines the latter and it means something else
+   * (protect the *stack* from deletion).
+   *
+   * Set `false` before `cdk destroy`; the stack cannot delete a protected
+   * instance. It can also be cleared live, without a deploy:
+   * `aws ec2 modify-instance-attribute --instance-id <id> --no-disable-api-termination`
+   * (the next deploy re-asserts it).
+   *
+   * @default true
+   */
+  readonly instanceTerminationProtection?: boolean;
 }
 
 /**
@@ -110,12 +150,34 @@ export interface BastionStackProps extends cdk.StackProps {
  *
  *   - **t4g.nano** on **Amazon Linux 2023 arm64** — the cheapest current-gen
  *     instance (t4g is Graviton, so the AMI must be arm64; AL2023 ships the SSM
- *     agent preinstalled).
+ *     agent preinstalled). The exact image is pinned per region in SSM, not
+ *     tracked live — see below.
  *   - Lives in a **public subnet** (`publicSubnets[0]`) so it reaches the SSM
  *     endpoints (and later the Tailscale coordination server) over the free IGW
  *     — no NAT Gateway. An **Elastic IP** is associated so that public IPv4
  *     (~$3.6/mo) is stable across stop/start, which also aids Tailscale NAT
  *     traversal later. Its address is published to SSM as `.../endpoint`.
+ *
+ * ## Not losing the box: a pinned AMI, and termination protection
+ *
+ * This instance is the only thing in the repo whose contents cannot be rebuilt
+ * from the repo — Tailscale is brought up by hand on it — so both guards below
+ * exist to keep a routine `cdk deploy` from taking it away. They were added
+ * after a deploy on **2026-08-09** silently replaced it (terminating the box
+ * created on Jul 28) while changing nothing about the instance at all.
+ *
+ *   1. **The AMI is pinned** to `/derrops/region/bastion/ami-id`, a parameter
+ *      written by hand. The previous `latestAmazonLinux2023()` re-resolved
+ *      AWS's public "newest AL2023" pointer on every deploy, and a changed
+ *      `ImageId` replaces an instance — so every AL2023 release armed the next
+ *      deploy to rebuild the box. That is the cause, and this is the fix:
+ *      upgrading the image is now something you do, by overwriting the
+ *      parameter and redeploying, rather than something a deploy does to you.
+ *   2. **Termination protection** (`DisableApiTermination`, see
+ *      `instanceTerminationProtection`) catches whatever else forces a
+ *      replacement — a subnet change, an instance-type change, an unpinned
+ *      property added later. It does not prevent the replacement; it makes the
+ *      old box survive it, as a running orphan, instead of being deleted.
  *
  * ## Access
  *
@@ -168,11 +230,49 @@ export class BastionStack extends cdk.Stack {
       throw new Error('BastionStack requires at least one public subnet.');
     }
 
-    // t4g is Graviton — the AMI must be arm64. `latestAmazonLinux2023` resolves
-    // to an AWS-owned public SSM parameter at deploy time (not our config).
-    const imageId = ec2.MachineImage.latestAmazonLinux2023({
-      cpuType: ec2.AmazonLinuxCpuType.ARM_64,
-    }).getImage(this).imageId;
+    // ── The AMI, pinned in SSM ──────────────────────────────────────────────
+    // Read from *our* parameter, not from AWS's `latestAmazonLinux2023` public
+    // pointer. Both resolve at deploy time and both are region-portable, but
+    // AWS moves theirs: it names whatever AL2023 image is newest, so the
+    // ImageId changed under a deploy that touched nothing about the instance,
+    // and ImageId replaces an instance. This parameter changes only when
+    // somebody changes it, so a deploy is no longer a coin flip on whether the
+    // hand-configured box survives.
+    //
+    // The parameter is deliberately not created here. Two reasons, and the
+    // second is the hard one:
+    //   - Its whole purpose is to be a value a deploy never touches. A
+    //     stack-managed parameter would be re-asserted from source on every
+    //     deploy, which is the behaviour being escaped.
+    //   - CloudFormation resolves an `AWS::SSM::Parameter::Value<...>`
+    //     parameter before it touches any resource, so a parameter this stack
+    //     creates could not be one it also reads — the first deploy would fail
+    //     on the read regardless.
+    // `bin/region-bootstrap.ts` therefore seeds it (with the latest AL2023
+    // arm64 image, create-if-absent) *before* synth — see `ensureAmiParameter`.
+    // Upgrading afterwards is an overwrite plus a deploy, and nothing else.
+    //
+    // Typed as AWS::EC2::Image::Id so CloudFormation rejects a value that is
+    // not an AMI id before it reaches the instance. t4g is Graviton, so
+    // whatever is pinned must be an **arm64** image — nothing here can check
+    // that, and a mismatch fails at launch.
+    let imageId = props.amiId;
+    if (imageId) {
+      // A literal id, which template validation flags (W9010) as unportable —
+      // correctly, in general. Here it is an explicit override of the pin,
+      // reached only when a caller passes `amiId`; the default path below is
+      // exactly the parameter W9010 asks for.
+      cdk.Validations.of(this).acknowledge({
+        id: 'CloudFormation-Validate::W9010',
+        reason: `AMI pinned explicitly via the amiId prop; the default reads ${amiParameterName}.`,
+      });
+    } else {
+      imageId = ssm.StringParameter.valueForTypedStringParameterV2(
+        this,
+        amiParameterName,
+        ssm.ParameterValueType.AWS_EC2_IMAGE_ID,
+      );
+    }
 
     // ── IAM role + instance profile (SSM Session Manager) ───────────────────
     // Deliberately *unnamed* — the one exception to the always-use-a-convention
@@ -182,7 +282,7 @@ export class BastionStack extends cdk.Stack {
     // resource types (S3 buckets) — there is no convention name that stays
     // unique per region. CDK generates a unique physical name instead; find the
     // role via the derrops:* tags or the instance profile.
-    const role = new iam.Role(this, 'BastionRole', {
+    const role = new iam.Role(this, naming.name({ type: 'iamRole', purpose: 'bastion' }), {
       assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
       managedPolicies: [
         // The only access path: connect via SSM Session Manager, no SSH.
@@ -255,6 +355,28 @@ export class BastionStack extends cdk.Stack {
       subnetId: subnet.ref,
       securityGroupIds: [sg.attrGroupId],
       iamInstanceProfile: instanceProfile.ref,
+      // Termination protection, on by default. Everything on this box is set up
+      // by hand (Tailscale), so a terminate is the one unrecoverable event here
+      // — and the deploy of 2026-08-09 did exactly that, via the unpinned AMI
+      // the parameter above now fixes. This is the backstop for the *next*
+      // cause: any replacement property (subnet, instance type, a property
+      // added later) does the same thing, and there is no reason to find out
+      // which one the hard way twice.
+      //
+      // Read what this does and does not buy precisely:
+      //   - EC2 refuses the terminate, so the existing box SURVIVES. That is
+      //     the point: the state on it is recoverable.
+      //   - It does NOT stop the replacement. CloudFormation still creates a
+      //     new instance and repoints the EIP and every SSM parameter at it,
+      //     then fails to delete the old one — which is left running,
+      //     detached from the stack and still billing. That failure is the
+      //     alarm; clean the orphan up by hand once you have what you need
+      //     off it.
+      //   - It does not affect stop/start, so the auto-stop Lambda is
+      //     unaffected — it only ever calls StopInstances.
+      //   - `cdk destroy` cannot delete the instance until this is cleared.
+      //
+      disableApiTermination: props.instanceTerminationProtection ?? true,
     });
     cdk.Tags.of(this.instance).add('Name', instanceName);
 

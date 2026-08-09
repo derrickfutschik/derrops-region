@@ -3,6 +3,10 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    // Required by ts-jest for the NodeNext module kind above — it transpiles
+    // file-by-file and warns on every test run without it. Also a correctness
+    // guard: it rejects constructs that cannot be compiled one file at a time.
+    "isolatedModules": true,
     "lib": [
       "es2022"
     ],
