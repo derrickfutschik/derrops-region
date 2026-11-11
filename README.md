@@ -14,7 +14,7 @@ this one is deployed once per region and is pinned to none.
 | Scope | the whole AWS account | one AWS region |
 | Deployed | once | once per region |
 | Region | fixed `us-east-1` (billing metrics only exist there) | `-c region=<aws-region>`, required |
-| Stacks | parameters, alerting, budget | network, bastion |
+| Stacks | parameters, alerting, budget | network, bastion, egress |
 
 ## Deploying a region
 
@@ -64,13 +64,15 @@ account-global and therefore left unnamed — see
 
 Each stack is documented in its own file under [`docs/`](docs/), named after the
 stack's generated name. Deploy order (enforced via `addStackDependency`):
-`derrops--region--network` → `derrops--region--bastion`, since the bastion
-consumes the VPC's public subnets.
+`derrops--region--network` → `derrops--region--bastion` → `derrops--region--egress`.
+The bastion consumes the VPC's public subnets, and the egress stack routes the
+VPC's private tier through the bastion.
 
 | Stack | CDK class | Docs |
 | --- | --- | --- |
 | `derrops--region--network` | `VpcStack` | [docs/derrops--region--network.md](docs/derrops--region--network.md) |
 | `derrops--region--bastion` | `BastionStack` | [docs/derrops--region--bastion.md](docs/derrops--region--bastion.md) |
+| `derrops--region--egress` | `EgressStack` | [docs/derrops--region--egress.md](docs/derrops--region--egress.md) |
 
 ## Reading account-level config
 

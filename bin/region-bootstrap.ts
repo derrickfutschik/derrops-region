@@ -7,6 +7,7 @@ import {
   naming as bastionNaming,
 } from '../lib/bastion-stack';
 import { ensureAmiParameter } from '../lib/ensure-ami-parameter';
+import { EgressStack, naming as egressNaming } from '../lib/egress-stack';
 
 const app = new cdk.App();
 
@@ -53,6 +54,19 @@ const bastion = new BastionStack(
   },
 );
 bastion.addStackDependency(vpc);
+
+// Outbound internet for the private tier: its 0.0.0.0/0 route (to the bastion,
+// as a NAT instance) and a free S3 gateway endpoint. Its own stack, so the
+// egress target can change later in one deploy. See lib/egress-stack.ts.
+const egress = new EgressStack(app, egressNaming.name({ type: 'cloudFormationStack' }), {
+  env,
+  description: "Outbound internet for the region VPC's private tier (default route + S3 endpoint).",
+  vpc: vpc.vpc,
+  privateRouteTable: vpc.privateRouteTable,
+  target: { kind: 'instance', instance: bastion.instance },
+});
+egress.addStackDependency(vpc);
+egress.addStackDependency(bastion);
 
 // ── Seed the bastion's AMI pin, if this region has never had one ────────────
 // The one piece of setup that cannot live in a stack: `BastionStack` reads the

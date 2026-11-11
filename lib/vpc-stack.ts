@@ -75,8 +75,9 @@ export interface VpcStackProps extends cdk.StackProps {
  * bill for no benefit. Consequently:
  *
  *   - `public`  subnets route `0.0.0.0/0` → IGW (in + out).
- *   - `private` subnets get a route table with **no default route**. To give
- *     the private tier outbound later, pick the cheapest option that fits:
+ *   - `private` subnets get a route table with **no default route** in this
+ *     stack. `EgressStack` (`derrops--region--egress`) owns that route; today it
+ *     points at the bastion as a NAT instance. The options, cheapest first:
  *       • an **egress-only IGW** (free, but IPv6-only — requires enabling IPv6);
  *       • routing `0.0.0.0/0` through the Tailscale box as a NAT/subnet router;
  *       • a NAT **instance** (a tiny EC2 running NAT — ~$3–4/mo);
@@ -118,6 +119,12 @@ export class VpcStack extends cdk.Stack {
   public readonly privateSubnets: ec2.CfnSubnet[] = [];
   /** Isolated-tier subnets (no internet route at all). */
   public readonly isolatedSubnets: ec2.CfnSubnet[] = [];
+  /**
+   * The private tier's route table, shared by every private subnet. It has no
+   * default route here; `EgressStack` (`derrops--region--egress`) adds one, so
+   * the egress target can change without touching this stack.
+   */
+  public readonly privateRouteTable: ec2.CfnRouteTable;
 
   constructor(scope: Construct, id: string, props: VpcStackProps = {}) {
     super(scope, id, {
@@ -232,11 +239,15 @@ export class VpcStack extends cdk.Stack {
       isolated: this.isolatedSubnets,
     };
 
+    let privateRouteTable: ec2.CfnRouteTable | undefined;
     for (const kind of SUBNET_KINDS) {
       // ── Route table (one per tier) ───────────────────────────────────────
       const rtName = domain.routeTables[kind]!;
       const routeTable = new ec2.CfnRouteTable(this, rtName, { vpcId: this.vpc.ref });
       cdk.Tags.of(routeTable).add('Name', rtName);
+      if (kind === 'private') {
+        privateRouteTable = routeTable;
+      }
 
       // Only the public tier gets a default route — to the free IGW. The
       // private and isolated tiers are intentionally left with no 0.0.0.0/0
@@ -274,6 +285,11 @@ export class VpcStack extends cdk.Stack {
         subnetsByKind[kind]!.push(subnet);
       }
     }
+
+    if (!privateRouteTable) {
+      throw new Error('VpcStack: SUBNET_KINDS must include the private tier.');
+    }
+    this.privateRouteTable = privateRouteTable;
 
     // ── Discovery for out-of-app areas (SDK/CLI read at runtime) ────────────
     // Derived values that track the stack → plain StringParameters (not the

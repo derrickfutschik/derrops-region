@@ -43,7 +43,7 @@ existing subnet's CIDR, so CloudFormation provisions only the new subnets.
 
 | Tier | Routing | Typical residents |
 | --- | --- | --- |
-| `private` | **No default route by default** (no NAT — see below) | app servers, ECS tasks, Lambda-in-VPC |
+| `private` | No default route in this stack. [`derrops--region--egress`](derrops--region--egress.md) adds `0.0.0.0/0` → the bastion (NAT instance) | app servers, ECS tasks, Lambda-in-VPC |
 | `public` | `0.0.0.0/0` → Internet Gateway | load balancers, bastion, **the Tailscale relay** |
 | `isolated` | No internet route at all | RDS/Aurora, OpenSearch, ElastiCache |
 
@@ -52,8 +52,10 @@ existing subnet's CIDR, so CloudFormation provisions only the new subnets.
 The stack creates one **Internet Gateway** (free — you pay only for data
 transfer, which you'd pay anyway) and **zero NAT Gateways**. A NAT Gateway is
 ~$0.045/hr (~$32/mo) + $0.045/GB; for an account whose main tenant is a single
-small relay box that would dominate the bill. So the `private` tier is left with
-no `0.0.0.0/0` route. To give it egress later, cheapest-first:
+small relay box that would dominate the bill. So this stack leaves the `private`
+tier with no `0.0.0.0/0` route. That route is owned by
+[`derrops--region--egress`](derrops--region--egress.md), which today points it at
+the bastion as a NAT instance. The options, cheapest-first:
 
 - **Egress-only IGW** — free, but IPv6-only (requires enabling IPv6 on the VPC).
 - **Route through the Tailscale box** acting as a NAT / subnet router.

@@ -65,6 +65,20 @@ test('only the public tier has a default route, and it points at the IGW', () =>
   template.resourceCountIs('AWS::EC2::RouteTable', 3);
 });
 
+// EgressStack owns the private tier's default route, so it needs the table.
+test('exposes the private tier route table for EgressStack', () => {
+  const app = new cdk.App();
+  const stack = new VpcStack(app, 'TestVpcStack', { env });
+  const nameTag = cdk.Tags.of(stack.privateRouteTable);
+  expect(nameTag).toBeDefined();
+  const template = Template.fromStack(stack);
+  const logicalId = stack.resolve(stack.privateRouteTable.ref).Ref;
+  template.hasResource('AWS::EC2::RouteTable', {});
+  expect(template.toJSON().Resources[logicalId].Properties.Tags).toEqual(
+    expect.arrayContaining([{ Key: 'Name', Value: 'derrops--region--private' }]),
+  );
+});
+
 test('publishes discovery params, including the Tailscale relay subnet pointer', () => {
   const template = synth();
   template.hasResourceProperties('AWS::SSM::Parameter', {
