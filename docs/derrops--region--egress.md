@@ -41,18 +41,50 @@ The route alone isn't enough. Two more pieces make the bastion forward traffic:
      --region ap-southeast-2 --name /derrops/region/bastion/instance-id \
      --query Parameter.Value --output text)"
 
-   # On the box:
-   echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/90-nat.conf
-   sudo sysctl --system
-   sudo dnf install -y iptables-services
-   IF=$(ip route show default | awk '{print $5}')
-   sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/16 -o "$IF" -j MASQUERADE
-   sudo service iptables save
-   sudo systemctl enable --now iptables
+   # On the box (as root): IP forwarding, now and at boot
+   echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/90-derrops-nat.conf
+   sysctl -p /etc/sysctl.d/90-derrops-nat.conf
+
+   # An idempotent script that adds the MASQUERADE rule (ens5 is the egress NIC)
+   cat > /usr/local/sbin/derrops-nat <<'EOF'
+   #!/bin/bash
+   set -euo pipefail
+   RULE=(-s 10.0.0.0/16 ! -d 10.0.0.0/16 -o ens5 -j MASQUERADE -m comment --comment derrops-nat)
+   iptables -t nat -C POSTROUTING "${RULE[@]}" 2>/dev/null || iptables -t nat -A POSTROUTING "${RULE[@]}"
+   EOF
+   chmod 0755 /usr/local/sbin/derrops-nat
+
+   # A oneshot unit runs it at every boot
+   cat > /etc/systemd/system/derrops-nat.service <<'EOF'
+   [Unit]
+   Description=NAT (MASQUERADE) for the region VPC private tier
+   After=network-online.target
+   Wants=network-online.target
+
+   [Service]
+   Type=oneshot
+   ExecStart=/usr/local/sbin/derrops-nat
+   RemainAfterExit=yes
+
+   [Install]
+   WantedBy=multi-user.target
+   EOF
+   systemctl daemon-reload && systemctl enable --now derrops-nat.service
+
+   # Check
+   sysctl net.ipv4.ip_forward
+   iptables -t nat -S POSTROUTING   # the derrops-nat rule
+   iptables -S FORWARD              # policy ACCEPT
    ```
 
-   Both settings survive reboot and stop/start. They live only on the instance,
-   so a replacement loses them, the same as Tailscale.
+   The unit adds only its own rule. It deliberately doesn't use
+   `iptables-services`, which saves and restores the whole ruleset at boot,
+   Tailscale's chains included, and ships default `REJECT` rules that would
+   block forwarding.
+
+   Both settings survive reboot and stop/start, so the daily auto-stop is fine:
+   NAT comes back with the box. They live only on the instance, so a
+   replacement loses them, the same as Tailscale.
 
 The bastion's security group already allows all traffic from the VPC CIDR in and
 everything out, so it needs no change.
@@ -63,8 +95,9 @@ Check it from a private-tier Lambda or instance, e.g. `curl -sI https://sqs.ap-s
 
 The bastion stops itself every day at 04:00 AEST. While it's stopped, the
 private tier has no egress (and, today, no Postgres or OpenSearch either, which
-the bastion also proxies). To keep it up, turn the auto-stop off; the parameter
-is seeded, so later deploys don't reset it:
+the bastion also proxies). Auto-stop is left on for now, so start the box
+before using the API outside its hours. To keep it up instead, turn the
+auto-stop off; the parameter is seeded, so later deploys don't reset it:
 
 ```bash
 aws ssm put-parameter --region ap-southeast-2 --overwrite \

@@ -193,6 +193,16 @@ name in two regions is two independent resources.
   advertising routes — otherwise the two subnet routers advertise overlapping
   prefixes to the same tailnet.
 
+## NAT instance for the private tier
+
+The bastion is also the private tier's NAT instance:
+[`derrops--region--egress`](derrops--region--egress.md) routes the private
+tier's `0.0.0.0/0` to it. This stack turns the **source/destination check off**
+(`SourceDestCheck: false`, an in-place update), since EC2 otherwise drops
+forwarded packets. IP forwarding and the `MASQUERADE` rule are set up on the box
+by hand; the steps are in the egress stack's doc. While the box is stopped, the
+private tier has no egress.
+
 ## Scripts
 
 Wrappers around the three things you do to a bastion. Each takes the region as
@@ -405,56 +415,90 @@ psql "$(aws ssm get-parameter --region ap-southeast-2 \
   --name /derrops/region/postgres/url --query Parameter.Value --output text)/mydb"
 ```
 
+#### Endpoint settings
+
+OpenSearch gets two more parameters in the same namespace, describing **how** to
+talk to the endpoint — the part a consumer cannot derive from `host`/`port`/`url`:
+
+| Parameter | Seeded value | Meaning |
+| --- | --- | --- |
+| `/derrops/region/opensearch/auth-mode` | `basic` | `basic` (username/password from the `users/` parameters), `iam` (SigV4 with the caller's own credentials), or `anonymous` |
+| `/derrops/region/opensearch/service` | `es` | SigV4 signing service, used only in `iam` mode: `es` for a managed domain, `aoss` for Serverless |
+
+Unlike `host`/`port`/`url`, these are **seeded, not managed**. That split is the
+point: `host`/`port`/`url` are facts about the bastion the stack knows and must
+keep current, while these are choices about the endpoint the stack cannot know.
+They are exactly what you change when the cluster moves off the bastion tunnel
+onto a managed domain, and that edit has to survive the next deploy:
+
+```bash
+aws ssm put-parameter --region ap-southeast-2 \
+  --name /derrops/region/opensearch/auth-mode --type String --overwrite --value iam
+```
+
+Postgres gets no equivalent — nothing about reaching it varies per deployment
+shape the way OpenSearch's auth does.
+
 ### Credentials
 
-Each service also gets a **`SecureString`** parameter per user:
+Each service also gets a set of parameters per user — **one parameter per
+field**, under `.../users/<username>/`:
 
-| Parameter |
-| --- |
-| `/derrops/region/postgres/users/derrops-platform` |
-| `/derrops/region/opensearch/users/derrops-platform` |
+| Parameter | Type | Seeded value |
+| --- | --- | --- |
+| `/derrops/region/postgres/users/derrops-platform/engine` | `String` | `postgres` |
+| `/derrops/region/postgres/users/derrops-platform/host` | `String` | the bastion's private IPv4 |
+| `/derrops/region/postgres/users/derrops-platform/port` | `String` | `5432` |
+| `/derrops/region/postgres/users/derrops-platform/dbname` | `String` | `postgres` |
+| `/derrops/region/postgres/users/derrops-platform/username` | `String` | `derrops-platform` |
+| `/derrops/region/postgres/users/derrops-platform/password` | `SecureString` | `REPLACE-ME` |
+| `/derrops/region/opensearch/users/derrops-platform/engine` | `String` | `opensearch` |
+| `/derrops/region/opensearch/users/derrops-platform/host` | `String` | the bastion's private IPv4 |
+| `/derrops/region/opensearch/users/derrops-platform/port` | `String` | `9200` |
+| `/derrops/region/opensearch/users/derrops-platform/protocol` | `String` | `https` |
+| `/derrops/region/opensearch/users/derrops-platform/endpoint` | `String` | `https://<host>:9200` |
+| `/derrops/region/opensearch/users/derrops-platform/username` | `String` | `derrops-platform` |
+| `/derrops/region/opensearch/users/derrops-platform/password` | `SecureString` | `REPLACE-ME` |
 
-`users` is the key and the username is the `purpose` segment, so the library
-builds the path — the key itself never contains a `/`. One parameter per user
-puts the grant boundary at the parameter: an IAM policy can scope to
-`/derrops/region/postgres/users/*` or to a single user.
+`users` is the key, the username is the `purpose` segment and the field is the
+`kind` segment, so the library builds the path — the key itself never contains a
+`/`. That gives two nested grant boundaries: an IAM policy can scope to
+`/derrops/region/postgres/users/*`, to a single user, or to a subset of one
+user's fields — handing a consumer the connectivity fields while withholding
+`.../password`, which is the only `SecureString` of the set and the only one
+that needs `kms:Decrypt`.
+
+Read one field, or the whole set at once:
+
+```bash
+# One field
+aws ssm get-parameter --region ap-southeast-2 \
+  --name /derrops/region/postgres/users/derrops-platform/password \
+  --with-decryption --query Parameter.Value --output text
+
+# The whole set, as a name→value map
+aws ssm get-parameters-by-path --region ap-southeast-2 \
+  --path /derrops/region/postgres/users/derrops-platform \
+  --with-decryption \
+  --query 'Parameters[].{name:Name,value:Value}' --output table
+```
 
 #### The datasource-credentials convention
 
-The value is a **complete datasource descriptor**, not a bare password — one
-read hands a client everything it needs to connect. This is the shape Secrets
-Manager writes for an RDS secret, so a consumer that already understands one
-understands these. It is documented in each parameter's own `description`, since
-whoever opens it in the console to set the real password is exactly who needs to
-know the shape and is not reading the CDK source.
+The field names are a **complete datasource descriptor**, not just a password —
+reading the set hands a client everything it needs to connect. These are the
+field names Secrets Manager writes for an RDS secret, so a consumer that already
+understands one understands these.
 
-Postgres — `engine`, `host`, `port`, `dbname`, `username`, `password`:
+- Postgres: `engine`, `host`, `port`, `dbname`, `username`, `password`.
+- OpenSearch: the same minus `dbname`, plus what an HTTP datasource needs —
+  `protocol`, and `endpoint` pre-assembled so a client need not join
+  scheme/host/port itself.
 
-```json
-{
-  "engine": "postgres",
-  "host": "10.0.4.189",
-  "port": 5432,
-  "dbname": "postgres",
-  "username": "derrops-platform",
-  "password": "super-secret-password"
-}
-```
-
-OpenSearch — the same, plus what an HTTP datasource needs: `protocol`, and
-`endpoint` pre-assembled so a client need not join scheme/host/port itself:
-
-```json
-{
-  "engine": "opensearch",
-  "host": "10.0.4.189",
-  "port": 9200,
-  "protocol": "https",
-  "endpoint": "https://10.0.4.189:9200",
-  "username": "derrops-platform",
-  "password": "super-secret-password"
-}
-```
+Every value is a string, because SSM stores nothing else: `port` reads back as
+`"5432"`, not `5432`. Each parameter's own `description` says what that one
+field holds and how to edit it, since whoever opens it in the console is exactly
+who needs that and is not reading the CDK source.
 
 Two values are worth calling out because they differ from what a *managed* AWS
 datasource would carry:
@@ -466,33 +510,64 @@ datasource would carry:
 
 The `host`, `port` and `endpoint` fields are **seed-time** values: they are
 written once and never re-asserted (see below), so if the bastion instance is
-ever replaced they go stale in this blob while
+ever replaced they go stale here while
 `/derrops/region/<service>/{host,port,url}` update with the stack. Those
-sibling parameters are the authoritative ones for connectivity; treat this blob
+sibling parameters are the authoritative ones for connectivity; treat this set
 as authoritative for **credentials**.
 
-**These are seeded, not managed.** CloudFormation's `AWS::SSM::Parameter` cannot
-create a `SecureString` at all, so they go through
+**These are seeded, not managed.** They go through
 [`SeedParameter`](../lib/seed-parameter.ts) — an `AwsCustomResource` calling
 `ssm:PutParameter` with `Overwrite: false`, which writes only if the parameter
-is absent. Encryption uses the account's default `alias/aws/ssm` key.
+is absent. (For the password it is also the only option available:
+CloudFormation's `AWS::SSM::Parameter` cannot create a `SecureString` at all.
+Encryption uses the account's default `alias/aws/ssm` key.)
 
-The seeded blob carries `"password": "REPLACE-ME"`, and it **reaches the
-CloudFormation template in plaintext** — that is why the password is a
-placeholder while every other field is real. Set the real value out-of-band,
-once:
+Every seeded value **reaches the CloudFormation template in plaintext** — that
+is why the password is a placeholder while every other field is real. Set the
+real password out-of-band, once:
 
 ```bash
 aws ssm put-parameter --region ap-southeast-2 \
-  --name /derrops/region/postgres/users/derrops-platform \
-  --type SecureString --overwrite \
-  --value '{"engine":"postgres","host":"10.0.4.189","port":5432,"dbname":"postgres","username":"derrops-platform","password":"…"}'
+  --name /derrops/region/postgres/users/derrops-platform/password \
+  --type SecureString --overwrite --value '…'
 ```
 
 `Overwrite: false` is what makes that safe: after the first seed, no `cdk deploy`
-re-asserts, re-seeds, or diffs the live value, so the real credentials survive
-every future deployment. A test asserts the template carries only the
-placeholder.
+re-asserts, re-seeds, or diffs the live value. The same protection covers every
+other field, so an edit that outgrows the seed — a `dbname` naming a database
+provisioned later, a `username` other than `derrops-platform` — survives every
+future deployment too. A test asserts the template carries only the placeholder
+password.
+
+#### Migrating off the old blob parameter
+
+These replace a single `SecureString` JSON blob per user, at
+`/derrops/region/<service>/users/derrops-platform` with no field segment:
+
+```json
+{"engine":"postgres","host":"…","port":5432,"dbname":"…","username":"…","password":"…"}
+```
+
+A blob is only convenient for a consumer that reads all of it at once; split, a
+caller reads the one value its client wants, and rotating the password touches
+the password rather than a re-serialized copy of every other field.
+
+`SeedParameter` defines no `onDelete` call, so **removing it from the stack does
+not delete the live parameter** — the old blob, real password and all, stays in
+SSM as an orphan that no stack manages. That is deliberate (nothing here can
+destroy a credential), but it does leave a stale second copy of the password.
+Once every consumer reads the per-field parameters, delete it by hand:
+
+```bash
+aws ssm delete-parameter --region ap-southeast-2 \
+  --name /derrops/region/postgres/users/derrops-platform
+aws ssm delete-parameter --region ap-southeast-2 \
+  --name /derrops/region/opensearch/users/derrops-platform
+```
+
+Note the per-field parameters are seeded with the **placeholder** password, not
+the blob's real one — nothing copies it across. Read the password out of the
+blob before deleting it and `put-parameter` it into `.../password`.
 
 If these ever need rotation, cross-account access, or generated passwords,
 that is the point to move them to Secrets Manager — SSM `SecureString` is the

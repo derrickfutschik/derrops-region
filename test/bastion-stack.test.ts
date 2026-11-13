@@ -113,6 +113,15 @@ test('termination protection is overridable', () => {
   });
 });
 
+// It's the private tier's NAT instance (EgressStack); with the check on, EC2
+// drops every forwarded packet.
+test('has the source/destination check off, so it can forward as a NAT', () => {
+  const template = synth();
+  template.hasResourceProperties('AWS::EC2::Instance', {
+    SourceDestCheck: false,
+  });
+});
+
 test('lands in the provided public subnet', () => {
   const template = synth();
   template.hasResourceProperties('AWS::EC2::Instance', {
@@ -345,83 +354,137 @@ function seededCalls(template: Template) {
   });
 }
 
-test('seeds a SecureString credentials parameter per proxied service', () => {
+/** The seeded credential parameters, keyed by parameter name. */
+function credentialParams(template: Template) {
+  return new Map(
+    seededCalls(template)
+      .filter((c) => c.parameters.Name.includes('/users/'))
+      .map((c) => [c.parameters.Name as string, c]),
+  );
+}
+
+test('seeds one credential parameter per field, not a JSON blob', () => {
   const template = synth();
-  const created = seededCalls(template).filter((c) => c.parameters.Type === 'SecureString');
-  expect(created).toHaveLength(2);
-  // `users` + username as `purpose`, so the library builds the path — the key
-  // itself never contains a '/'.
-  expect(created.map((c) => c.parameters.Name).sort()).toEqual([
-    '/derrops/region/opensearch/users/derrops-platform',
-    '/derrops/region/postgres/users/derrops-platform',
+  const created = credentialParams(template);
+
+  // `users` + username as `purpose` + the field as `kind`, so the library
+  // builds the path — the key itself never contains a '/'. The blob parameter
+  // these replaced (.../users/derrops-platform, with no field segment) must be
+  // gone: two sources of truth for one password is exactly the drift the split
+  // was meant to remove.
+  expect([...created.keys()].sort()).toEqual([
+    '/derrops/region/opensearch/users/derrops-platform/endpoint',
+    '/derrops/region/opensearch/users/derrops-platform/engine',
+    '/derrops/region/opensearch/users/derrops-platform/host',
+    '/derrops/region/opensearch/users/derrops-platform/password',
+    '/derrops/region/opensearch/users/derrops-platform/port',
+    '/derrops/region/opensearch/users/derrops-platform/protocol',
+    '/derrops/region/opensearch/users/derrops-platform/username',
+    '/derrops/region/postgres/users/derrops-platform/dbname',
+    '/derrops/region/postgres/users/derrops-platform/engine',
+    '/derrops/region/postgres/users/derrops-platform/host',
+    '/derrops/region/postgres/users/derrops-platform/password',
+    '/derrops/region/postgres/users/derrops-platform/port',
+    '/derrops/region/postgres/users/derrops-platform/username',
   ]);
 
-  for (const c of created) {
-    // CloudFormation's AWS::SSM::Parameter cannot create a SecureString at all,
-    // which is why these are SDK calls rather than managed parameters.
-    expect(c.parameters.Type).toBe('SecureString');
-    // Create-if-absent: the real value, set out-of-band, is never clobbered by
-    // a later deploy, and never diffed against the placeholder.
+  for (const c of created.values()) {
+    // Create-if-absent: a value set out-of-band — a rotated password, a dbname
+    // naming a database provisioned since — is never clobbered by a later
+    // deploy, and never diffed against the seed.
     expect(c.parameters.Overwrite).toBe(false);
     expect(c.ignoreErrorCodesMatching).toBe('ParameterAlreadyExists');
   }
 });
 
-test('no real credential is baked into the template', () => {
+test('only the password is a SecureString', () => {
   const template = synth();
-  // The seeded value reaches the template in plaintext, so the password must
-  // stay a recognisable placeholder. If someone ever pastes a real secret into
-  // PLACEHOLDER_SECRET, this is the test that should stop them.
-  for (const call of seededCalls(template)) {
-    if (call.parameters.Type !== 'SecureString') continue;
-    expect(JSON.parse(call.parameters.Value).password).toBe('REPLACE-ME');
+  for (const [name, c] of credentialParams(template)) {
+    // CloudFormation's AWS::SSM::Parameter cannot create a SecureString at all,
+    // which is why these are SDK calls rather than managed parameters. The rest
+    // are connectivity metadata, and stay readable without kms:Decrypt.
+    expect(c.parameters.Type).toBe(name.endsWith('/password') ? 'SecureString' : 'String');
   }
 });
 
-test('credentials follow the datasource convention, documented on the parameter', () => {
+test('seeds the OpenSearch endpoint settings beside host/port/url', () => {
   const template = synth();
-  const byName = new Map(
-    seededCalls(template)
-      .filter((c) => c.parameters.Type === 'SecureString')
-      .map((c) => [c.parameters.Name, c.parameters]),
+  const byName = new Map(seededCalls(template).map((c) => [c.parameters.Name as string, c.parameters]));
+
+  // auth-mode and service describe the *endpoint*, not one user, so they sit in
+  // the service namespace rather than under users/. Seeded rather than managed:
+  // host/port/url are facts about the bastion the stack knows and must keep
+  // current, while these are choices about the endpoint it cannot know — the
+  // switches you flip when the cluster moves onto a managed domain.
+  expect(byName.get('/derrops/region/opensearch/auth-mode')).toMatchObject({
+    Value: 'basic',
+    Type: 'String',
+    Overwrite: false,
+  });
+  expect(byName.get('/derrops/region/opensearch/service')).toMatchObject({
+    Value: 'es',
+    Type: 'String',
+    Overwrite: false,
+  });
+
+  // Postgres gets no equivalent: nothing about reaching it varies per
+  // deployment shape the way OpenSearch's auth does.
+  expect(byName.has('/derrops/region/postgres/auth-mode')).toBe(false);
+  expect(byName.has('/derrops/region/postgres/service')).toBe(false);
+});
+
+test('no real credential is baked into the template', () => {
+  const template = synth();
+  // Every seeded value reaches the template in plaintext, so the password must
+  // stay a recognisable placeholder. If someone ever pastes a real secret into
+  // PLACEHOLDER_SECRET, this is the test that should stop them.
+  const passwords = [...credentialParams(template)].filter(([n]) => n.endsWith('/password'));
+  expect(passwords).toHaveLength(2);
+  for (const [, c] of passwords) {
+    expect(c.parameters.Value).toBe('REPLACE-ME');
+  }
+});
+
+test('credential fields follow the datasource convention', () => {
+  const template = synth();
+  const values = new Map(
+    [...credentialParams(template)].map(([name, c]) => [name, c.parameters.Value]),
   );
 
-  // engine/host/port/dbname + user — the shape Secrets Manager writes for an
-  // RDS secret, so a consumer that understands one understands this.
-  expect(
-    JSON.parse(byName.get('/derrops/region/postgres/users/derrops-platform')!.Value),
-  ).toEqual({
-    engine: 'postgres',
-    host: '10.0.4.189', // the bastion's private IP token
-    port: 5432,
-    dbname: 'postgres',
-    username: 'derrops-platform',
-    password: 'REPLACE-ME',
-  });
+  // engine/host/port/dbname + user — the field names Secrets Manager writes for
+  // an RDS secret, so a consumer that understands one understands this. Values
+  // are strings: SSM stores nothing else, so the numeric `port` is '5432'.
+  const pg = '/derrops/region/postgres/users/derrops-platform';
+  expect(values.get(`${pg}/engine`)).toBe('postgres');
+  expect(values.get(`${pg}/host`)).toBe('10.0.4.189'); // the bastion's private IP token
+  expect(values.get(`${pg}/port`)).toBe('5432');
+  expect(values.get(`${pg}/dbname`)).toBe('postgres');
+  expect(values.get(`${pg}/username`)).toBe('derrops-platform');
 
   // Same, plus what an HTTP datasource needs: protocol, and a pre-assembled
   // endpoint so a client need not join scheme/host/port itself. Port 9200 (the
   // tunnel on the bastion), not the 443 of a managed OpenSearch domain.
-  expect(
-    JSON.parse(byName.get('/derrops/region/opensearch/users/derrops-platform')!.Value),
-  ).toEqual({
-    engine: 'opensearch',
-    host: '10.0.4.189',
-    port: 9200,
-    protocol: 'https',
-    endpoint: 'https://10.0.4.189:9200',
-    username: 'derrops-platform',
-    password: 'REPLACE-ME',
-  });
+  const os = '/derrops/region/opensearch/users/derrops-platform';
+  expect(values.get(`${os}/engine`)).toBe('opensearch');
+  expect(values.get(`${os}/host`)).toBe('10.0.4.189');
+  expect(values.get(`${os}/port`)).toBe('9200');
+  expect(values.get(`${os}/protocol`)).toBe('https');
+  expect(values.get(`${os}/endpoint`)).toBe('https://10.0.4.189:9200');
+  expect(values.get(`${os}/username`)).toBe('derrops-platform');
+});
 
-  for (const [name, params] of byName) {
-    // Whoever opens this in the console to set the real password is exactly who
-    // needs to know the shape, and they are not reading the CDK source.
-    expect(params.Description).toContain('"engine"');
-    expect(params.Description).toContain('put-parameter');
+test('each credential parameter documents itself', () => {
+  const template = synth();
+  for (const [name, c] of credentialParams(template)) {
+    // Whoever opens one of these in the console to set a real value is exactly
+    // who needs to know what it holds and how to edit it, and they are not
+    // reading the CDK source. Each stands alone: with a parameter per field, a
+    // reader sees only this description, not the set's.
+    const field = name.split('/').pop()!;
+    expect(c.parameters.Description).toContain(field);
+    expect(c.parameters.Description).toContain('put-parameter');
     // SSM caps descriptions at 1024 characters.
-    expect(params.Description.length).toBeLessThanOrEqual(1024);
-    expect(name).toMatch(/\/users\/derrops-platform$/);
+    expect(c.parameters.Description.length).toBeLessThanOrEqual(1024);
   }
 });
 

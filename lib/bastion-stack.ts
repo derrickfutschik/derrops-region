@@ -27,6 +27,45 @@ const PLATFORM_USER = { id: 'DerropsPlatform', name: 'derrops-platform' };
 const PLACEHOLDER_SECRET = 'REPLACE-ME';
 
 /**
+ * An editable fact about a proxied endpoint that a consumer needs but cannot
+ * derive from `host`/`port`/`url` — how to authenticate to it, and how to sign
+ * if that authentication is SigV4.
+ */
+type EndpointSetting = { key: string; value: string; description: string };
+
+/**
+ * A kebab-case parameter key as a CDK construct id fragment: `auth-mode` →
+ * `AuthMode`. Construct ids are part of a resource's logical id, so this has to
+ * stay stable — changing it replaces the custom resource.
+ */
+const pascal = (key: string) =>
+  key.replace(/(^|-)(.)/g, (_, __, c: string) => c.toUpperCase());
+
+/**
+ * Credential fields that hold a secret, and so must be seeded as a
+ * `SecureString`. Everything else in a credentials set is connectivity metadata
+ * — engine, host, port — and stays a plain `String`, readable by a consumer
+ * that has no `kms:Decrypt`.
+ */
+const SECRET_FIELDS = new Set(['password']);
+
+/**
+ * What each credential field holds, said on the parameter itself. With one
+ * parameter per field, whoever opens a single one in the console sees only its
+ * own description — so each has to stand alone rather than describe the set.
+ */
+const FIELD_DESCRIPTIONS: Record<string, string> = {
+  engine: 'The datasource engine identifier.',
+  host: "Host to connect to: the region bastion's private IPv4, which proxies this service.",
+  port: 'Port the service answers on, on the region bastion.',
+  dbname: 'Database to connect to.',
+  protocol: 'URL scheme for the endpoint.',
+  endpoint: 'protocol://host:port, pre-assembled so a client need not join the parts itself.',
+  username: 'Username to authenticate as.',
+  password: 'Password for this user.',
+};
+
+/**
  * When the bastion is powered off each day, expressed in the local time we
  * actually care about (AEST) and the offset that converts it to the UTC an
  * EventBridge rule needs.
@@ -377,6 +416,12 @@ export class BastionStack extends cdk.Stack {
       //   - `cdk destroy` cannot delete the instance until this is cleared.
       //
       disableApiTermination: props.instanceTerminationProtection ?? true,
+      // The bastion is the private tier's NAT instance (EgressStack routes the
+      // private tier's 0.0.0.0/0 here). EC2 drops packets that aren't addressed
+      // to the instance itself unless this check is off. Changing it is an
+      // in-place, no-interruption update, never a replacement. The NAT itself
+      // (ip_forward + MASQUERADE) is set up by hand on the box, like Tailscale.
+      sourceDestCheck: false,
     });
     cdk.Tags.of(this.instance).add('Name', instanceName);
 
@@ -642,6 +687,10 @@ export class BastionStack extends cdk.Stack {
         // libpq's URI scheme; callers append their own /database and credentials.
         scheme: 'postgresql',
         port: '5432',
+        // Nothing about reaching Postgres varies per deployment shape the way
+        // OpenSearch's auth does — a client connects with the credentials or it
+        // does not.
+        settings: [] as EndpointSetting[],
         // The datasource-credentials convention: engine/host/port/dbname plus
         // the user. Same shape Secrets Manager writes for an RDS secret, so a
         // consumer that already understands one understands this.
@@ -651,12 +700,10 @@ export class BastionStack extends cdk.Stack {
           port: 5432,
           // The always-present default database — a real value rather than a
           // placeholder, since it is right until someone provisions another.
-          dbname: 'postgres',
+          dbname: 'derrops',
           username: PLATFORM_USER.name,
           password: PLACEHOLDER_SECRET,
         },
-        shape:
-          '{"engine":"postgres","host":…,"port":5432,"dbname":…,"username":…,"password":…}',
       },
       {
         id: 'Opensearch',
@@ -668,6 +715,29 @@ export class BastionStack extends cdk.Stack {
         // the tunnel is a plaintext cluster.
         scheme: 'https',
         port: '9200',
+        // How a client is expected to talk to this endpoint — the two things a
+        // consumer needs but cannot derive from host/port/url. They describe the
+        // *endpoint*, not one user, so they sit beside host/port/url rather than
+        // under `users/`.
+        //
+        // Seeded rather than managed, because these are precisely the switches
+        // you flip when the cluster moves off the bastion onto a managed domain,
+        // and that edit has to stick. Nothing in this stack knows when that
+        // happens, so nothing here may re-assert them.
+        settings: [
+          {
+            key: 'auth-mode',
+            value: 'basic',
+            description:
+              "How to authenticate to OpenSearch: 'basic' (username/password from the users/ parameters beside this one), 'iam' (SigV4 with the caller's own credentials, no username needed), or 'anonymous'. 'basic' while the cluster is the security-plugin-enabled node behind the bastion tunnel; change it here when that changes.",
+          },
+          {
+            key: 'service',
+            value: 'es',
+            description:
+              "SigV4 signing service name, used only when auth-mode is 'iam': 'es' for a managed OpenSearch domain, 'aoss' for Serverless. Ignored in basic/anonymous mode, but published unconditionally so a consumer never has to guess it while switching.",
+          },
+        ],
         // Same convention, with the fields an HTTP datasource needs on top:
         // protocol, and `endpoint` pre-assembled so a client need not join
         // scheme/host/port itself.
@@ -683,8 +753,6 @@ export class BastionStack extends cdk.Stack {
           username: PLATFORM_USER.name,
           password: PLACEHOLDER_SECRET,
         },
-        shape:
-          '{"engine":"opensearch","host":…,"port":9200,"protocol":"https","endpoint":…,"username":…,"password":…}',
       },
     ];
 
@@ -725,30 +793,71 @@ export class BastionStack extends cdk.Stack {
         ns.applyTags((k, v) => cdk.Tags.of(param).add(k, v));
       }
 
-      // ── Credentials, seeded once ─────────────────────────────────────────
-      // `users` + the username as `purpose`, so the library builds the path —
-      // never a '/' inside a key. One parameter per user keeps the grant
-      // boundary at the parameter: an IAM policy can scope to
-      // /derrops/region/postgres/users/* or to a single user.
+      // ── Endpoint settings, seeded once ───────────────────────────────────
+      // Siblings of host/port/url — same namespace, because they describe the
+      // endpoint rather than any one user — but seeded rather than managed:
+      // host/port/url are facts about the bastion that the stack knows and must
+      // keep current, while these are choices about the endpoint that the stack
+      // cannot know and must not overwrite.
+      for (const s of p.settings) {
+        new SeedParameter(this, `${p.id}${pascal(s.key)}Param`, {
+          parameterName: ns.name({ type: 'ssmParam', key: s.key }),
+          value: s.value,
+          description: [
+            `${p.label} ${s.key}, as reached via the region bastion.`,
+            s.description,
+            `Seeded once and never re-asserted — edit it with: aws ssm put-parameter --name <this> --type String --overwrite --value '<value>'.`,
+          ].join(' '),
+        });
+      }
+
+      // ── Credentials, seeded once, one parameter per field ────────────────
+      // `users` + the username as `purpose` + the field as `kind`, so the
+      // library builds the path — never a '/' inside a key. The user segment
+      // keeps the grant boundary where it was (an IAM policy can still scope to
+      // /derrops/region/postgres/users/* or to one user), and the field segment
+      // adds a finer one below it: a consumer can be handed the connectivity
+      // fields and not the password.
       //
-      // Seeded, not managed: the value below is a placeholder that reaches the
-      // template in plaintext, and `SeedParameter` writes it only if the
-      // parameter does not already exist. Set the real credentials out-of-band
-      // once (see docs), and no later deploy re-asserts or diffs them.
-      new SeedParameter(this, `${p.id}${p.user.id}CredentialsParam`, {
-        parameterName: ns.name({ type: 'ssmParam', key: 'users', purpose: p.user.name }),
-        type: 'SecureString',
-        value: JSON.stringify(p.credentials),
-        // The shape is documented on the parameter itself: whoever opens this in
-        // the console to set the real password is exactly who needs to know what
-        // the JSON must contain, and they are not reading this file.
-        description: [
-          `${p.label} credentials for the ${p.user.name} user, reached via the region bastion.`,
-          `SecureString, seeded with a placeholder password (${PLACEHOLDER_SECRET}) — set the real value with: aws ssm put-parameter --name <this> --type SecureString --overwrite --value '<json>'.`,
-          `Shape: ${p.shape}`,
-          `The host/port fields are seed-time values and are never re-asserted; /derrops/region/${p.service}/{host,port,url} are the authoritative connectivity parameters.`,
-        ].join(' '),
-      });
+      // A field per parameter rather than one JSON blob, because a blob is only
+      // convenient for whoever reads all of it at once. Split, a caller reads
+      // the one value its client wants — or the whole set in a single
+      // `aws ssm get-parameters-by-path --path .../users/derrops-platform
+      // --with-decryption` — and rotating the password touches the password,
+      // not a re-serialized copy of every other field.
+      //
+      // Seeded, not managed: every value below reaches the template in
+      // plaintext, and `SeedParameter` writes each only if that parameter does
+      // not already exist. So live values that have since diverged from these
+      // seeds — a rotated password, a `dbname` naming a database someone
+      // provisioned later — survive every subsequent deploy untouched.
+      for (const [field, value] of Object.entries(p.credentials)) {
+        const secret = SECRET_FIELDS.has(field);
+        const type = secret ? 'SecureString' : 'String';
+        new SeedParameter(this, `${p.id}${p.user.id}${pascal(field)}Param`, {
+          parameterName: ns.name({
+            type: 'ssmParam',
+            key: 'users',
+            purpose: p.user.name,
+            kind: field,
+          }),
+          type,
+          // Numbers in the credentials set (port) are parameter values like any
+          // other — SSM stores strings.
+          value: String(value),
+          // Documented on the parameter itself: whoever opens this in the
+          // console to set the real value is exactly who needs to know what it
+          // is and that editing it sticks, and they are not reading this file.
+          description: [
+            `${p.label} ${field} for the ${p.user.name} user, reached via the region bastion.`,
+            FIELD_DESCRIPTIONS[field],
+            secret
+              ? `Seeded with a placeholder (${PLACEHOLDER_SECRET}) — set the real value with: aws ssm put-parameter --name <this> --type ${type} --overwrite --value '<value>'.`
+              : `Seeded once and never re-asserted — edit it with: aws ssm put-parameter --name <this> --type ${type} --overwrite --value '<value>'.`,
+            `Siblings under .../users/${p.user.name}/ complete the set; /derrops/region/${p.service}/{host,port,url} are the authoritative connectivity parameters.`,
+          ].join(' '),
+        });
+      }
     }
   }
 }
