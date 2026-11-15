@@ -3,8 +3,8 @@ import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib/core';
 import { Construct } from 'constructs';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
-import * as events from 'aws-cdk-lib/aws-events';
-import * as targets from 'aws-cdk-lib/aws-events-targets';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cwActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
@@ -66,30 +66,10 @@ const FIELD_DESCRIPTIONS: Record<string, string> = {
 };
 
 /**
- * When the bastion is powered off each day, expressed in the local time we
- * actually care about (AEST) and the offset that converts it to the UTC an
- * EventBridge rule needs.
- *
- * **AEST is fixed UTC+10** — the arithmetic below is deliberately offset-based,
- * not zone-based, because an EventBridge *rule* cron is evaluated in UTC and has
- * no timezone field at all (only the newer EventBridge *Scheduler* does). So
- * during Sydney's daylight saving (AEDT, UTC+11) this fires at 05:00 local
- * rather than 04:00. For "power the box off overnight" that hour is immaterial;
- * if it ever matters, move the schedule to `scheduler.CfnSchedule` with
- * `ScheduleExpressionTimezone: 'Australia/Sydney'`.
- *
- * Region-independent by construction: the cron is UTC, so the same template is
- * correct in every region this stack is deployed to.
+ * The power Lambda's source, next to this file so an editor treats it as the
+ * JavaScript it is. Read verbatim into `lambda.Code.fromInline` below.
  */
-const STOP_HOUR_AEST = 4;
-const AEST_UTC_OFFSET_HOURS = 10;
-const STOP_HOUR_UTC = (STOP_HOUR_AEST - AEST_UTC_OFFSET_HOURS + 24) % 24;
-
-/**
- * The auto-stop Lambda's source, next to this file so an editor treats it as
- * the JavaScript it is. Read verbatim into `lambda.Code.fromInline` below.
- */
-const AUTO_STOP_HANDLER_FILE = 'bastion-auto-stop.js';
+const POWER_HANDLER_FILE = 'bastion-power.js';
 
 /**
  * Design-time naming segments for the bastion stack. Every resource name, the
@@ -116,6 +96,28 @@ export const naming = new DerropsConventions({
  */
 export const amiParameterName = naming.name({ type: 'ssmParam', key: 'ami-id' });
 
+/**
+ * The custom metric that asks for the bastion to be on. Any service that needs
+ * the box posts a value above 0 to it (`cloudwatch:PutMetricData`); the alarm
+ * in this stack starts the instance, and stops it again once the metric has
+ * stayed at 0 — or silent — for the whole hold.
+ *
+ * Namespace and dimensions come from the convention: the namespace is
+ * org/domain only, and the service is a dimension, not part of the name. The
+ * library has no resource type for a metric *name* (it is not an AWS resource
+ * name), so that follows its documented PascalCase style instead.
+ *
+ * A datapoint only counts if it carries exactly these dimensions — CloudWatch
+ * treats every distinct dimension set as a separate metric. Region-portable:
+ * the same metric exists independently in each region, so a publisher has to
+ * post to the region whose bastion it wants.
+ */
+export const powerMetric = {
+  namespace: naming.name({ type: 'cloudwatchMetricNamespace' }),
+  metricName: 'PowerOnRequests',
+  dimensions: naming.dimensions(),
+};
+
 export interface BastionStackProps extends cdk.StackProps {
   /** The region's VPC (from `VpcStack`) the bastion launches into. */
   readonly vpc: ec2.CfnVPC;
@@ -136,12 +138,14 @@ export interface BastionStackProps extends cdk.StackProps {
   readonly instanceType?: string;
 
   /**
-   * When the daily auto-stop Lambda runs. **The expression is evaluated in
-   * UTC** — an EventBridge rule cron has no timezone.
+   * How long the bastion stays on after the last power-on request — the time
+   * the metric must stay at 0 (or silent) before the alarm returns to OK and
+   * the box is stopped. Whole minutes, at most a day (CloudWatch's limit on an
+   * alarm's evaluation window).
    *
-   * @default 04:00 AEST (`cron(0 18 * * ? *)`, i.e. 18:00 UTC)
+   * @default 4 hours
    */
-  readonly autoStopSchedule?: events.Schedule;
+  readonly powerOnHold?: cdk.Duration;
 
   /**
    * AMI for the bastion, pinned in source rather than read from SSM.
@@ -230,24 +234,24 @@ export interface BastionStackProps extends cdk.StackProps {
  *     Tailscale subnet router) can reach the box on its private IP. Egress is
  *     unrestricted.
  *
- * ## Automatic shutdown
+ * ## Power on demand
  *
- * An EventBridge rule fires a small Lambda at **04:00 AEST every day**, which
- * calls `ec2:StopInstances` on this instance and nothing else. Stopping is the
- * cost lever (see `scripts/bastion-stop.sh`): stopped, the box bills only its
- * EBS root volume and its idle Elastic IP, and its instance id, address,
- * security group and SSM parameters all survive. Start it again with
- * `scripts/bastion-start.sh`; note the Lambda cannot reverse that — a box left
- * running is off again by the next morning, and anything brought up by hand on
- * it (Tailscale) needs bringing up again.
+ * The box is off unless something asks for it. Asking is posting a value above
+ * 0 to the `powerMetric` custom metric: a CloudWatch alarm on that metric goes
+ * to ALARM on the first such datapoint and invokes a small Lambda, which calls
+ * `ec2:StartInstances`. The alarm returns to OK only once the metric has been
+ * 0 or silent for the whole hold (4 hours by default), and that transition
+ * invokes the same Lambda to call `ec2:StopInstances`. Stopping is the cost
+ * lever: stopped, the box bills only its EBS root volume and its idle Elastic
+ * IP, and its instance id, address, security group and SSM parameters all
+ * survive — but anything brought up by hand on it (Tailscale) needs bringing
+ * up again.
  *
- * Two SSM parameters go with it. `.../auto-stop/enabled` is a **runtime kill
- * switch**: the rule always fires, but the Lambda reads this first and skips
- * the stop unless it is `'true'`. It is seeded, not managed, so setting it to
- * `false` for an overnight job survives every later deploy — and nothing sets
- * it back for you. `.../auto-stop/schedule` is the opposite: read-only, taken
- * off the same `events.Schedule` the rule was built from so the two cannot
- * drift.
+ * `.../auto-stop/enabled` is a **runtime kill switch** for the stop half only:
+ * the Lambda reads it before stopping and leaves the box running unless it is
+ * `'true'`. It is seeded, not managed, so setting it to `false` survives every
+ * later deploy — and nothing sets it back for you. `.../power-metric` publishes
+ * the metric's coordinates for publishers outside this app.
  */
 export class BastionStack extends cdk.Stack {
   /** The bastion EC2 instance — consumers receive it by reference. */
@@ -411,8 +415,8 @@ export class BastionStack extends cdk.Stack {
       //     detached from the stack and still billing. That failure is the
       //     alarm; clean the orphan up by hand once you have what you need
       //     off it.
-      //   - It does not affect stop/start, so the auto-stop Lambda is
-      //     unaffected — it only ever calls StopInstances.
+      //   - It does not affect stop/start, so the power Lambda is
+      //     unaffected — it only ever calls Start/StopInstances.
       //   - `cdk destroy` cannot delete the instance until this is cleared.
       //
       disableApiTermination: props.instanceTerminationProtection ?? true,
@@ -450,26 +454,31 @@ export class BastionStack extends cdk.Stack {
       instanceId: this.instance.ref,
     });
 
-    // ── Daily auto-stop (04:00 AEST) ────────────────────────────────────────
-    // The instance is only ever wanted while someone is using it, and the one
-    // failure mode that costs real money is forgetting to stop it. A rule + a
-    // Lambda that calls StopInstances makes "off" the resting state without
-    // touching anything that must survive — stopping preserves the instance id,
+    // ── Power on demand (custom metric → alarm → Lambda) ────────────────────
+    // The instance is only ever wanted while something is using it, and the one
+    // failure mode that costs real money is leaving it running. So "off" is the
+    // resting state, and being on has to be *asked for*: a service posts a value
+    // above 0 to `powerMetric`, the alarm below goes to ALARM and the Lambda
+    // starts the box; once the requests stop, the alarm falls back to OK after
+    // the hold and the same Lambda stops it. Stopping preserves the instance id,
     // the EIP association, the security group and every SSM parameter above.
-    //
-    // The Lambda is deliberately one-directional: it never starts the box. That
-    // is what makes it safe to run unattended — the worst it can do is stop
-    // something already stopped, which the API treats as a no-op.
-    const autoStopSchedule =
-      props.autoStopSchedule ??
-      events.Schedule.cron({ minute: '0', hour: String(STOP_HOUR_UTC) });
+    const powerOnHold = props.powerOnHold ?? cdk.Duration.hours(4);
+    // One evaluation period per minute of hold. `toMinutes()` throws on a
+    // fractional minute; the range check is CloudWatch's own — an alarm's
+    // evaluation window cannot exceed a day.
+    const holdMinutes = powerOnHold.toMinutes();
+    if (holdMinutes < 1 || holdMinutes > 24 * 60) {
+      throw new Error(
+        `BastionStack: powerOnHold must be between 1 minute and 1 day; got ${holdMinutes} minutes.`,
+      );
+    }
 
-    // The kill switch. Seeded (create-if-absent) rather than CloudFormation-
-    // managed, so flipping it to 'false' in the console survives every later
-    // deploy — that is the whole point of a switch you reach for at 2am. The
-    // *rule* always fires; the lambda reads this on each run and skips the stop
-    // when it is not 'true'. Gating in the lambda rather than on the rule's
-    // State keeps the toggle a runtime edit instead of a deploy.
+    // The kill switch for the *stop* half. Seeded (create-if-absent) rather
+    // than CloudFormation-managed, so flipping it to 'false' in the console
+    // survives every later deploy — that is the whole point of a switch you
+    // reach for at 2am. The alarm always fires; the lambda reads this before
+    // each stop and leaves the box running when it is not 'true'. Starting is
+    // never gated: a request for the box is always honoured.
     const autoStopEnabledParamName = naming.name({
       type: 'ssmParam',
       key: 'auto-stop',
@@ -479,30 +488,33 @@ export class BastionStack extends cdk.Stack {
       parameterName: autoStopEnabledParamName,
       value: 'true',
       description:
-        "Whether the daily bastion auto-stop runs. Set to 'false' to suspend it without a deploy (any other value also suspends it); 'true' to resume. Seeded once — never re-asserted by a deploy. If the parameter is deleted the stop still runs.",
+        "Whether the bastion is stopped when its power-on requests lapse. Set to 'false' to keep it running without a deploy (any other value also suspends the stop); 'true' to resume. Seeded once — never re-asserted by a deploy. If the parameter is deleted the stop still runs.",
     });
 
-    const autoStopLogGroup = new logs.LogGroup(this, 'BastionAutoStopLogGroup', {
+    const powerLogGroup = new logs.LogGroup(this, 'BastionPowerLogGroup', {
       // Lambda would otherwise create /aws/lambda/<fn-name> itself, with
       // retention set to never expire. Naming it here puts it under the same
       // convention as everything else and bounds what it keeps.
-      logGroupName: naming.name({ type: 'cloudwatchLogsGroup', key: 'auto-stop' }),
+      logGroupName: naming.name({ type: 'cloudwatchLogsGroup', key: 'power' }),
       retention: logs.RetentionDays.ONE_MONTH,
-      // Nothing here is worth keeping after the stack goes: one line per day
-      // recording a state transition that EC2 itself already knows about.
+      // Nothing here is worth keeping after the stack goes: one line per
+      // state transition that EC2 itself already knows about.
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    const autoStopFn = new lambda.Function(this, 'BastionAutoStopFunction', {
+    const powerFn = new lambda.Function(this, 'BastionPowerFunction', {
       // Lambda function names are region-scoped, so the convention name is safe
       // to repeat per region — unlike the role above, which stays unnamed.
-      functionName: naming.name({ type: 'lambdaFunction', key: 'auto-stop' }),
+      functionName: naming.name({ type: 'lambdaFunction', key: 'power' }),
       runtime: lambda.Runtime.NODEJS_22_X,
       // arm64 for the same reason the instance is Graviton: cheaper per ms.
       architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
-      timeout: cdk.Duration.seconds(30),
-      logGroup: autoStopLogGroup,
+      // Long enough to wait out a box that is still `stopping` when a new
+      // request arrives — EC2 rejects a start until it has fully stopped, and
+      // the handler retries for up to 2½ minutes.
+      timeout: cdk.Duration.minutes(3),
+      logGroup: powerLogGroup,
       environment: {
         // The instance id is passed rather than looked up: it is right here in
         // this stack, so a runtime read would only add a failure mode. The
@@ -511,25 +523,25 @@ export class BastionStack extends cdk.Stack {
         INSTANCE_ID: this.instance.ref,
         ENABLED_PARAM: autoStopEnabledParamName,
       },
-      // Inline, not a bundled asset: the whole function is two API calls, and
+      // Inline, not a bundled asset: the whole function is three API calls, and
       // the AWS SDK v3 ships in the Node.js runtime, so there is nothing to
       // build. It stays readable in the synthesized template and in the console.
       //
       // The source is a real `.js` file rather than a string literal here, so
       // an editor highlights and checks it and its decision logic has its own
-      // unit test (`test/bastion-auto-stop.test.ts`) — it is read verbatim, so
+      // unit test (`test/bastion-power.test.ts`) — it is read verbatim, so
       // what runs in Lambda is exactly what that test exercises. `fromInline`
       // caps the code at 4 KB; a test asserts the file still fits.
       code: lambda.Code.fromInline(
-        fs.readFileSync(path.join(__dirname, AUTO_STOP_HANDLER_FILE), 'utf8'),
+        fs.readFileSync(path.join(__dirname, POWER_HANDLER_FILE), 'utf8'),
       ),
     });
 
-    // Exactly one action on exactly one instance — the ARN is built from this
+    // Exactly two actions on exactly one instance — the ARN is built from this
     // stack's own region/account, so the grant cannot reach a box elsewhere.
-    autoStopFn.addToRolePolicy(
+    powerFn.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ['ec2:StopInstances'],
+        actions: ['ec2:StartInstances', 'ec2:StopInstances'],
         resources: [
           this.formatArn({
             service: 'ec2',
@@ -542,7 +554,7 @@ export class BastionStack extends cdk.Stack {
     );
     // Read-only, and only the switch — not the whole parameter tree. The
     // credentials parameters live under sibling paths in the same account.
-    autoStopFn.addToRolePolicy(
+    powerFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['ssm:GetParameter'],
         resources: [
@@ -556,33 +568,58 @@ export class BastionStack extends cdk.Stack {
       }),
     );
 
-    // The rule is **always enabled** — `enabled` is left at its default `true`
-    // and nothing here can turn it off. It fires every day regardless of the
-    // switch; the lambda re-reads `.../auto-stop/enabled` on each invocation
-    // and decides then. Suspending the stop is therefore a live SSM edit, with
-    // no deploy and no drift between the rule's State and the parameter.
-    new events.Rule(this, 'BastionAutoStopRule', {
-      ruleName: naming.name({ type: 'eventBridgeRule', key: 'auto-stop' }),
-      description: `Stop the bastion daily at ${STOP_HOUR_AEST}:00 AEST (${STOP_HOUR_UTC}:00 UTC), unless ${autoStopEnabledParamName} says otherwise.`,
-      // Cron fields not given default to '*', except day-of-week, which
-      // EventBridge requires as '?' when day-of-month is '*' — Schedule.cron
-      // fills that in. Result: cron(0 18 * * ? *).
-      schedule: autoStopSchedule,
-      targets: [new targets.LambdaFunction(autoStopFn)],
+    // "Any request in the last <hold>": the alarm looks back over one
+    // one-minute period per minute of hold and needs just ONE of them above 0.
+    //   - A single datapoint > 0 is enough to go to ALARM, on the alarm's next
+    //     evaluation (CloudWatch evaluates once a minute, so "straight away"
+    //     is within about a minute of the datapoint landing).
+    //   - It returns to OK only when *every* period in the window is clear,
+    //     i.e. a full hold after the last request. Each new request pushes
+    //     that out again.
+    //   - Maximum, so one publisher's 0 cannot average away another's 1 in the
+    //     same minute.
+    //   - Missing data counts as not breaching: a publisher that simply stops
+    //     posting releases the box exactly like one that posts 0.
+    const powerAlarm = new cloudwatch.Alarm(this, 'BastionPowerAlarm', {
+      // Alarm names are region-scoped, so the convention name repeats safely.
+      alarmName: naming.name({ type: 'cloudwatchAlarm', key: 'power' }),
+      alarmDescription: `Bastion power: ALARM (start) on any ${powerMetric.namespace} ${powerMetric.metricName} above 0, OK (stop) once it has been 0 or silent for ${holdMinutes} minutes.`,
+      metric: new cloudwatch.Metric({
+        namespace: powerMetric.namespace,
+        metricName: powerMetric.metricName,
+        dimensionsMap: Object.fromEntries(
+          powerMetric.dimensions.map((d) => [d.Name, d.Value]),
+        ),
+        statistic: cloudwatch.Stats.MAXIMUM,
+        period: cdk.Duration.minutes(1),
+      }),
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      threshold: 0,
+      evaluationPeriods: holdMinutes,
+      datapointsToAlarm: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
+    // The alarm invokes the Lambda directly on both transitions; the handler
+    // reads the new state off the event. No INSUFFICIENT_DATA action: with
+    // missing data treated as not breaching, that state is only ever the
+    // alarm's first moment of life, which is not a reason to touch the box.
+    powerAlarm.addAlarmAction(new cwActions.LambdaAction(powerFn));
+    powerAlarm.addOkAction(new cwActions.LambdaAction(powerFn));
 
-    // The schedule, published so it can be read without a `cdk synth` or an
-    // events:DescribeRule call. CloudFormation-managed and taken off the very
-    // same Schedule object the rule above was built from, so it tracks the
-    // stack and cannot drift — unlike `.../enabled`, editing this changes
-    // nothing (EventBridge owns the schedule; change `autoStopSchedule` and
-    // deploy). Its description says so, since whoever opens it in the console
-    // is exactly who might otherwise assume it is a dial.
-    new ssm.StringParameter(this, 'BastionAutoStopScheduleParam', {
-      parameterName: naming.name({ type: 'ssmParam', key: 'auto-stop', purpose: 'schedule' }),
-      stringValue: autoStopSchedule.expressionString,
+    // The metric's coordinates, for publishers outside this app. One parameter
+    // holding all three, because they are only meaningful together — a
+    // datapoint with the right name but the wrong dimensions is a different
+    // metric and wakes nothing. CloudFormation-managed: it is derived from the
+    // same `powerMetric` the alarm is built from, so it cannot drift.
+    new ssm.StringParameter(this, 'BastionPowerMetricParam', {
+      parameterName: naming.name({ type: 'ssmParam', key: 'power-metric' }),
+      stringValue: JSON.stringify({
+        Namespace: powerMetric.namespace,
+        MetricName: powerMetric.metricName,
+        Dimensions: powerMetric.dimensions,
+      }),
       description:
-        `EventBridge schedule for the daily bastion auto-stop — evaluated in UTC (${STOP_HOUR_UTC}:00 UTC = ${STOP_HOUR_AEST}:00 AEST). Read-only: published by the stack, so editing it does not change when the stop runs.`,
+        `Where to post to turn the bastion on: PutMetricData with this Namespace, MetricName and Dimensions and a Value above 0, in this region. It stays on until ${holdMinutes} minutes after the last such datapoint. Read-only: published by the stack.`,
     });
 
     // ── Discovery for out-of-app areas (SDK/CLI read at runtime) ────────────

@@ -82,7 +82,7 @@ The route alone isn't enough. Two more pieces make the bastion forward traffic:
    Tailscale's chains included, and ships default `REJECT` rules that would
    block forwarding.
 
-   Both settings survive reboot and stop/start, so the daily auto-stop is fine:
+   Both settings survive reboot and stop/start, so the automatic stop is fine:
    NAT comes back with the box. They live only on the instance, so a
    replacement loses them, the same as Tailscale.
 
@@ -93,11 +93,14 @@ Check it from a private-tier Lambda or instance, e.g. `curl -sI https://sqs.ap-s
 
 ### Keep the bastion running
 
-The bastion stops itself every day at 04:00 AEST. While it's stopped, the
-private tier has no egress (and, today, no Postgres or OpenSearch either, which
-the bastion also proxies). Auto-stop is left on for now, so start the box
-before using the API outside its hours. To keep it up instead, turn the
-auto-stop off; the parameter is seeded, so later deploys don't reset it:
+The bastion is off unless something has asked for it in the last 4 hours (see
+[Power on demand](derrops--region--bastion.md#power-on-demand)). While it's
+stopped, the private tier has no egress (and, today, no Postgres or OpenSearch
+either, which the bastion also proxies). A service that needs it posts to the
+bastion's power-on metric — allow a minute or two for the alarm and the boot —
+or start it by hand with `./scripts/bastion-start.sh`. To keep it up instead,
+turn the automatic stop off; the parameter is seeded, so later deploys don't
+reset it:
 
 ```bash
 aws ssm put-parameter --region ap-southeast-2 --overwrite \

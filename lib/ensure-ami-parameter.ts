@@ -21,7 +21,7 @@ const DESCRIPTION = [
 
 /**
  * The SSM operations this needs, injected so the decision logic can be tested
- * without the SDK or a mocking framework (same approach as the auto-stop
+ * without the SDK or a mocking framework (same approach as the power
  * lambda). `ensureAmiParameter` supplies real ones by default.
  */
 export interface AmiParameterOps {

@@ -3,8 +3,7 @@ import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib/core';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
-import * as events from 'aws-cdk-lib/aws-events';
-import { BastionStack } from '../lib/bastion-stack';
+import { BastionStack, powerMetric } from '../lib/bastion-stack';
 
 const env = { account: '123456789012', region: 'us-east-1' };
 
@@ -232,12 +231,11 @@ test('publishes each access detail under a parameter named for its exact value',
   const byName = new Map(params.map((p) => [p.Properties.Name, p.Properties.Value]));
 
   expect([...byName.keys()].sort()).toEqual([
-    // The auto-stop schedule is derived and read-only; its sibling
     // `.../auto-stop/enabled` is editable and therefore seeded, not managed, so
-    // it is not an AWS::SSM::Parameter at all — see the auto-stop tests.
-    '/derrops/region/bastion/auto-stop/schedule',
+    // it is not an AWS::SSM::Parameter at all — see the power tests.
     '/derrops/region/bastion/eip-allocation-id',
     '/derrops/region/bastion/instance-id',
+    '/derrops/region/bastion/power-metric',
     '/derrops/region/bastion/private-dns-name',
     '/derrops/region/bastion/private-ip',
     '/derrops/region/bastion/public-ip',
@@ -515,58 +513,84 @@ function policyStatements(template: Template) {
   );
 }
 
-test('stops the bastion daily at 04:00 AEST', () => {
+/** The power alarm — the only alarm in the stack. */
+function powerAlarm(template: Template) {
+  const alarms = Object.values(template.findResources('AWS::CloudWatch::Alarm'));
+  expect(alarms).toHaveLength(1);
+  return alarms[0]!.Properties;
+}
+
+test('a power-on request alarms on the convention-named metric', () => {
   const template = synth();
-  template.resourceCountIs('AWS::Events::Rule', 1);
-  template.hasResourceProperties('AWS::Events::Rule', {
-    Name: 'derrops--region--bastion--auto-stop',
-    // AEST is UTC+10 and an EventBridge rule cron is evaluated in UTC with no
-    // timezone field, so 04:00 AEST is 18:00 UTC. This assertion is the guard
-    // on that arithmetic — the same expression is correct in every region.
-    ScheduleExpression: 'cron(0 18 * * ? *)',
-    State: 'ENABLED',
-    Targets: [
-      Match.objectLike({
-        // An L2 Function's logical id carries CDK's hash suffix, unlike the L1
-        // resources elsewhere in this stack.
-        Arn: {
-          'Fn::GetAtt': [Match.stringLikeRegexp('^BastionAutoStopFunction'), 'Arn'],
-        },
-      }),
-    ],
+  // The schedule is gone: nothing but the alarm turns the box on or off.
+  template.resourceCountIs('AWS::Events::Rule', 0);
+  template.hasResourceProperties('AWS::CloudWatch::Alarm', {
+    AlarmName: 'derrops--region--bastion--power',
+    // Namespace is org/domain only; the service is a dimension. Publishers pin
+    // against all three, so these are a contract, not an implementation detail.
+    Namespace: 'derrops/region',
+    MetricName: 'PowerOnRequests',
+    // Lowercase `service` is what the library actually emits (its README says
+    // `Service`) — asserted here because CloudWatch dimensions are case-sensitive.
+    Dimensions: [{ Name: 'service', Value: 'bastion' }],
+    // Maximum, so one publisher's 0 cannot average away another's 1.
+    Statistic: 'Maximum',
+    Period: 60,
+    ComparisonOperator: 'GreaterThanThreshold',
+    Threshold: 0,
   });
 });
 
-test('the schedule is overridable', () => {
-  const template = synth({
-    autoStopSchedule: events.Schedule.cron({ minute: '30', hour: '9' }),
-  });
-  template.hasResourceProperties('AWS::Events::Rule', {
-    ScheduleExpression: 'cron(30 9 * * ? *)',
-  });
+test('one request is enough to alarm, and OK takes four clear hours', () => {
+  const alarm = powerAlarm(synth());
+  // 1-of-240 one-minute periods: a single datapoint above 0 trips it on the
+  // next evaluation, and it clears only when all 240 minutes are clear.
+  expect(alarm.DatapointsToAlarm).toBe(1);
+  expect(alarm.EvaluationPeriods).toBe(240);
+  // A publisher that just stops posting must release the box like one that
+  // posts 0 — otherwise silence would pin the alarm in INSUFFICIENT_DATA.
+  expect(alarm.TreatMissingData).toBe('notBreaching');
 });
 
-test('the rule is always enabled — the switch is checked in the lambda', () => {
+test('the hold is overridable, within what CloudWatch can evaluate', () => {
+  expect(powerAlarm(synth({ powerOnHold: cdk.Duration.minutes(90) })).EvaluationPeriods).toBe(90);
+  // An alarm's evaluation window cannot exceed a day; fail at synth, not deploy.
+  expect(() => synth({ powerOnHold: cdk.Duration.hours(25) })).toThrow(/powerOnHold/);
+  expect(() => synth({ powerOnHold: cdk.Duration.seconds(0) })).toThrow(/powerOnHold/);
+});
+
+test('both alarm transitions invoke the power lambda, and only it may be invoked by this alarm', () => {
   const template = synth();
-  const [rule] = Object.values(template.findResources('AWS::Events::Rule'));
-  // Deliberately unconditional: the rule fires every day and the lambda decides
-  // once it is running. Gating on the rule's State instead would make
-  // suspending the stop a deploy, and would let the State and the parameter
-  // disagree about whether auto-stop is on.
-  expect(rule.Properties.State).toBe('ENABLED');
-  expect(JSON.stringify(rule.Properties.Targets)).not.toContain('auto-stop/enabled');
+  const alarm = powerAlarm(template);
+  const fnArn = {
+    // An L2 Function's logical id carries CDK's hash suffix, unlike the L1
+    // resources elsewhere in this stack.
+    'Fn::GetAtt': [expect.stringMatching(/^BastionPowerFunction/), 'Arn'],
+  };
+  expect(alarm.AlarmActions).toEqual([fnArn]);
+  expect(alarm.OKActions).toEqual([fnArn]);
+  // Missing data is not breaching, so INSUFFICIENT_DATA is only the alarm's
+  // first moment of life — not a reason to touch the box.
+  expect(alarm.InsufficientDataActions).toBeUndefined();
+
+  template.hasResourceProperties('AWS::Lambda::Permission', {
+    Action: 'lambda:InvokeFunction',
+    Principal: 'lambda.alarms.cloudwatch.amazonaws.com',
+    // Scoped to this alarm, so no other alarm in the account can drive it.
+    SourceArn: { 'Fn::GetAtt': [Match.stringLikeRegexp('^BastionPowerAlarm'), 'Arn'] },
+  });
 });
 
 test('the inline code is the real handler file, and still fits', () => {
   const template = synth();
   const source = fs.readFileSync(
-    path.join(__dirname, '../lib/bastion-auto-stop.js'),
+    path.join(__dirname, '../lib/bastion-power.js'),
     'utf8',
   );
   const [fn] = Object.values(template.findResources('AWS::Lambda::Function')).filter(
-    (f) => f.Properties.FunctionName === 'derrops--region--bastion--auto-stop',
+    (f) => f.Properties.FunctionName === 'derrops--region--bastion--power',
   );
-  // Read verbatim, so the unit tests in bastion-auto-stop.test.ts exercise
+  // Read verbatim, so the unit tests in bastion-power.test.ts exercise
   // exactly what Lambda will run.
   expect(fn.Properties.Code.ZipFile).toBe(source);
   // `Code.fromInline` caps the source at 4 KB. This is the assertion that turns
@@ -574,12 +598,12 @@ test('the inline code is the real handler file, and still fits', () => {
   expect(Buffer.byteLength(source, 'utf8')).toBeLessThanOrEqual(4096);
 });
 
-test('the auto-stop lambda targets this stack’s instance', () => {
+test('the power lambda targets this stack’s instance', () => {
   const template = synth();
   template.hasResourceProperties('AWS::Lambda::Function', {
     // Lambda function names are region-scoped, so a convention name is safe to
     // repeat per region (unlike the IAM role, which stays unnamed).
-    FunctionName: 'derrops--region--bastion--auto-stop',
+    FunctionName: 'derrops--region--bastion--power',
     Runtime: 'nodejs22.x',
     Architectures: ['arm64'],
     Environment: {
@@ -588,24 +612,23 @@ test('the auto-stop lambda targets this stack’s instance', () => {
   });
 });
 
-test('the auto-stop lambda may only stop, and only this instance', () => {
+test('the power lambda may only start and stop, and only this instance', () => {
   const template = synth();
   const ec2Statements = policyStatements(template).filter((s) =>
     JSON.stringify(s.Action).includes('ec2:'),
   );
 
   expect(ec2Statements).toHaveLength(1);
-  const [stop] = ec2Statements;
-  expect(stop.Action).toBe('ec2:StopInstances');
+  const [power] = ec2Statements;
+  expect(power.Action).toEqual(['ec2:StartInstances', 'ec2:StopInstances']);
   // Scoped to one instance ARN in this account and region — never '*', and
-  // never a start/terminate action. A rule that runs unattended every night
-  // must not be able to reach anything but the box it was written for.
-  expect(stop.Resource).not.toBe('*');
-  expect(JSON.stringify(stop.Resource)).toContain(
+  // never a terminate action. Something that runs unattended must not be able
+  // to reach anything but the box it was written for.
+  expect(power.Resource).not.toBe('*');
+  expect(JSON.stringify(power.Resource)).toContain(
     ':ec2:us-east-1:123456789012:instance/',
   );
-  expect(JSON.stringify(stop.Resource)).toContain('"BastionInstance"');
-  expect(JSON.stringify(policyStatements(template))).not.toContain('StartInstances');
+  expect(JSON.stringify(power.Resource)).toContain('"BastionInstance"');
   expect(JSON.stringify(policyStatements(template))).not.toContain('TerminateInstances');
 });
 
@@ -624,8 +647,8 @@ test('the enabled switch is seeded, so a deploy never re-asserts it', () => {
 
 test('the lambda reads the switch at runtime, and only that parameter', () => {
   const template = synth();
-  // Only the *name* is baked in — the value is read on each run, which is the
-  // whole point of the switch being editable between deploys.
+  // Only the *name* is baked in — the value is read before each stop, which is
+  // the whole point of the switch being editable between deploys.
   template.hasResourceProperties('AWS::Lambda::Function', {
     Environment: {
       Variables: Match.objectLike({
@@ -640,58 +663,59 @@ test('the lambda reads the switch at runtime, and only that parameter', () => {
   expect(ssmReads).toHaveLength(1);
   // Scoped to the switch alone. The bastion's SecureString credentials sit
   // under sibling paths in this same account, so a path wildcard here would
-  // hand a nightly cron job the ability to read them.
+  // hand an unattended function the ability to read them.
   expect(ssmReads[0].Resource).not.toBe('*');
   expect(JSON.stringify(ssmReads[0].Resource)).toContain(
     ':ssm:us-east-1:123456789012:parameter/derrops/region/bastion/auto-stop/enabled',
   );
 });
 
-test('publishes the schedule as a read-only parameter that tracks the rule', () => {
+test('publishes the metric coordinates, matching what the alarm watches', () => {
   const template = synth();
-  template.hasResourceProperties('AWS::SSM::Parameter', {
-    Name: '/derrops/region/bastion/auto-stop/schedule',
-    Value: 'cron(0 18 * * ? *)',
-    // Whoever opens this in the console is exactly who might assume it is a
-    // dial; the description has to say it is not.
-    Description: Match.stringLikeRegexp('Read-only'),
+  const [param] = Object.values(template.findResources('AWS::SSM::Parameter')).filter(
+    (p) => p.Properties.Name === '/derrops/region/bastion/power-metric',
+  );
+  const alarm = powerAlarm(template);
+  // A publisher that reads this must land on the very metric the alarm
+  // watches — a datapoint with different dimensions is a different metric.
+  expect(JSON.parse(param!.Properties.Value)).toEqual({
+    Namespace: alarm.Namespace,
+    MetricName: alarm.MetricName,
+    Dimensions: alarm.Dimensions,
+  });
+  expect(powerMetric).toEqual({
+    namespace: 'derrops/region',
+    metricName: 'PowerOnRequests',
+    dimensions: [{ Name: 'service', Value: 'bastion' }],
   });
 });
 
-test('the published schedule follows an overridden one, so the two cannot drift', () => {
-  const template = synth({
-    autoStopSchedule: events.Schedule.cron({ minute: '30', hour: '9' }),
-  });
-  template.hasResourceProperties('AWS::SSM::Parameter', {
-    Name: '/derrops/region/bastion/auto-stop/schedule',
-    Value: 'cron(30 9 * * ? *)',
-  });
-});
-
-test('the auto-stop lambda logs to a named group with bounded retention', () => {
+test('the power lambda logs to a named group with bounded retention', () => {
   const template = synth();
   template.hasResourceProperties('AWS::Logs::LogGroup', {
-    LogGroupName: '/derrops/region/bastion/auto-stop',
+    LogGroupName: '/derrops/region/bastion/power',
     RetentionInDays: 30,
   });
 });
 
-test('the auto-stop schedule and grant follow the region', () => {
-  // Second region, per the repo rule: the cron is UTC so it must NOT change,
-  // while the instance ARN in the grant must land in the region deployed to. A
-  // grant that stayed pinned to us-east-1 would silently fail to stop anything.
+test('the alarm is region-neutral and the grant follows the region', () => {
+  // Second region, per the repo rule: the metric and alarm names carry no
+  // region so they must NOT change, while the instance ARN in the grant must
+  // land in the region deployed to. A grant that stayed pinned to us-east-1
+  // would silently fail to start or stop anything.
   const template = synth({}, '10.0.0.0/16', {
     account: '123456789012',
     region: 'ap-southeast-2',
   });
-  template.hasResourceProperties('AWS::Events::Rule', {
-    Name: 'derrops--region--bastion--auto-stop',
-    ScheduleExpression: 'cron(0 18 * * ? *)',
+  template.hasResourceProperties('AWS::CloudWatch::Alarm', {
+    AlarmName: 'derrops--region--bastion--power',
+    Namespace: 'derrops/region',
+    MetricName: 'PowerOnRequests',
   });
-  const [stop] = policyStatements(template).filter((s) =>
+  const [power] = policyStatements(template).filter((s) =>
     JSON.stringify(s.Action).includes('ec2:'),
   );
-  expect(JSON.stringify(stop.Resource)).toContain(
+  expect(JSON.stringify(power.Resource)).toContain(
     ':ec2:ap-southeast-2:123456789012:instance/',
   );
 });

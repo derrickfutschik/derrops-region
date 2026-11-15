@@ -133,7 +133,7 @@ property added later.
 | The existing box **survives** | EC2 refuses the terminate. Whatever you set up on it is still there |
 | The replacement still **happens** | CloudFormation creates a new instance and repoints the EIP and every SSM parameter at it, then fails to delete the old one |
 | The old box becomes an **orphan** | Still running, still billing, no longer in the stack. That failed delete is the alarm — get what you need off it and terminate it by hand |
-| Stop/start is **unaffected** | Including the daily auto-stop, which only ever calls `StopInstances` |
+| Stop/start is **unaffected** | Including the power Lambda, which only ever calls `StartInstances` / `StopInstances` |
 | `cdk destroy` **blocks** | Pass `instanceTerminationProtection: false` and deploy first, or clear the attribute live: `aws ec2 modify-instance-attribute --region ap-southeast-2 --instance-id <id> --no-disable-api-termination` (the next deploy re-asserts it) |
 
 ## The IAM role is deliberately unnamed
@@ -219,7 +219,7 @@ you run a bastion anywhere else.
 | Script | What it does |
 | --- | --- |
 | [`scripts/bastion-session.sh`](../scripts/bastion-session.sh) | Open an interactive shell over SSM Session Manager |
-| [`scripts/bastion-start.sh`](../scripts/bastion-start.sh) | Start the instance; `--wait` blocks until it is running *and* online in SSM |
+| [`scripts/bastion-start.sh`](../scripts/bastion-start.sh) | Start the instance and post a power-on request, so it is stopped again after the hold; `--wait` blocks until it is running *and* online in SSM |
 | [`scripts/bastion-stop.sh`](../scripts/bastion-stop.sh) | Stop the instance; `--wait` blocks until it reaches `stopped` |
 
 ```bash
@@ -239,49 +239,117 @@ One thing does not survive a stop/start cycle:
   again after the box comes back — and while it is stopped, any routes it
   advertises are gone from the tailnet.
 
-## Automatic shutdown (04:00 AEST daily)
+## Power on demand
 
-You do not have to remember to run `bastion-stop.sh`. The stack schedules the
-stop itself, so **off is the resting state** and the expensive failure mode —
-leaving the box running for a week — cannot happen:
+The bastion is **off unless something asks for it**. Asking is posting a number
+above 0 to a CloudWatch custom metric; a CloudWatch alarm on that metric turns
+the box on, and turns it off again 4 hours after the last request:
 
 | Resource | Name | What it is |
 | --- | --- | --- |
-| EventBridge rule | `derrops--region--bastion--auto-stop` | `cron(0 18 * * ? *)` — fires once a day, **always enabled** |
-| Lambda function | `derrops--region--bastion--auto-stop` | Node.js 22, arm64, inline; checks the switch, then `ec2:StopInstances` |
-| Log group | `/derrops/region/bastion/auto-stop` | 30-day retention (Lambda's own default never expires) |
+| Custom metric | namespace `derrops/region`, name `PowerOnRequests`, dimension `service=bastion` | What publishers post to. Not a deployed resource — it exists once something posts |
+| CloudWatch alarm | `derrops--region--bastion--power` | `Maximum > 0` in **1 of the last 240** one-minute periods; missing data is not breaching |
+| Lambda function | `derrops--region--bastion--power` | Node.js 22, arm64, inline; invoked by the alarm on ALARM and on OK |
+| Log group | `/derrops/region/bastion/power` | 30-day retention (Lambda's own default never expires) |
 
-It is deliberately **one-directional** — the Lambda never *starts* the instance.
-That is what makes it safe to run unattended: the worst it can do is stop a box
-that is already stopped, which EC2 treats as a no-op. Start the bastion yourself
-with `./scripts/bastion-start.sh` whenever you need it; expect it to be off
-again by the next morning, along with anything you brought up by hand on it.
+How the alarm's shape gives the behaviour:
 
-Its IAM grant is two actions, each scoped to one ARN in this account and region:
-`ec2:StopInstances` on this instance, and `ssm:GetParameter` on the switch below
-— never `*`, never a path wildcard (the `SecureString` credentials sit under
-sibling paths), and never a start or terminate action. Tests assert all of that,
-since this is the one thing here that runs with nobody watching.
+1. **One datapoint above 0 → ALARM → start.** Only 1 of the 240 periods has to
+   breach, so the first request trips the alarm on its next evaluation and the
+   Lambda calls `ec2:StartInstances`. CloudWatch evaluates once a minute, so
+   expect the start within about a minute of the datapoint, then the usual boot
+   time on top.
+2. **240 clear minutes → OK → stop.** The alarm leaves ALARM only when *every*
+   period in the window is clear — 4 hours after the last request. Each new
+   request pushes that out again. On ALARM → OK the Lambda calls
+   `ec2:StopInstances`.
+3. **Posting 0 and going silent are the same thing.** Missing data is treated as
+   not breaching, so a publisher can post `0` when it is done or just stop
+   posting. Either way the hold runs from its last datapoint above 0.
+4. **`Maximum`, not `Average`** — one publisher's `0` cannot cancel another's
+   `1` in the same minute.
 
-### The two SSM parameters
+Change the hold with the `powerOnHold` prop (see the props table below).
 
-| Parameter | Value | Editable? |
-| --- | --- | --- |
-| `/derrops/region/bastion/auto-stop/enabled` | `true` | **Yes** — the kill switch, read on every run |
-| `/derrops/region/bastion/auto-stop/schedule` | `cron(0 18 * * ? *)` | No — published by the stack |
+### Requesting the bastion from another service
 
-**`enabled`** is a real runtime switch:
+The names come from `derrops-conventions`, so a service using the library
+derives them rather than hardcoding them — `org: 'derrops'`, `domain:
+'region'`, `service: 'bastion'`:
 
-1. The rule is **always enabled** — nothing in the stack turns it off — so it
-   fires every day at 18:00 UTC no matter what.
-2. Each firing invokes the Lambda, which **re-reads this parameter first** and
-   returns without touching EC2 unless the value is `true` (case- and
-   whitespace-insensitive; any other value suspends the stop).
+```typescript
+const bastion = new DerropsConventions({ org: 'derrops', domain: 'region', service: 'bastion' })
 
-Gating in the Lambda rather than on the rule's `State` is what makes suspending
-it a live edit instead of a deploy — and means there is no second place that can
-disagree about whether auto-stop is on. Suspend it — for an overnight job, a
-migration, a debugging session — with:
+await cloudwatch.send(new PutMetricDataCommand({
+  Namespace: bastion.name({ type: 'cloudwatchMetricNamespace' }), // 'derrops/region'
+  MetricData: [{
+    MetricName: 'PowerOnRequests',
+    Dimensions: bastion.dimensions(),                             // [{ Name: 'service', Value: 'bastion' }]
+    Value: 1,
+  }],
+}))
+```
+
+The same three values are published as JSON at
+`/derrops/region/bastion/power-metric` for anything that would rather read them
+at runtime, and exported as `powerMetric` from
+[`lib/bastion-stack.ts`](../lib/bastion-stack.ts). From a shell:
+
+```bash
+aws cloudwatch put-metric-data --region ap-southeast-2 \
+  --namespace derrops/region --metric-name PowerOnRequests \
+  --dimensions service=bastion --value 1
+```
+
+Things a publisher has to get right:
+
+- **The dimension is part of the metric's identity.** A datapoint without
+  `service=bastion` — or with `Service`, capitalised — is a *different* metric
+  and wakes nothing. (The library emits lowercase `service`; its README shows
+  `Service`. A test pins the real output.)
+- **Post to the bastion's region.** The metric exists independently in each
+  region, so the client needs an explicit region.
+- **Keep posting while you need the box.** One datapoint buys 4 hours. A
+  long-running consumer should post on each use, or on a timer comfortably
+  inside the hold.
+- **It needs `cloudwatch:PutMetricData`.** That action has no resource ARN —
+  scope it with a `cloudwatch:namespace` condition of `derrops/region`.
+- **Wait for the box.** Posting returns at once; the instance is reachable a
+  minute or two later. Retry the connection rather than assuming it is up.
+
+### What the alarm does not do
+
+The Lambda acts on alarm **transitions**, not on the alarm's standing state:
+
+- A request that arrives while the alarm is *already* in ALARM extends the hold
+  but invokes nothing. If someone stopped the box by hand in the meantime
+  (`bastion-stop.sh`), it stays stopped until the alarm has returned to OK and
+  tripped again — or until you start it by hand.
+- It stops the box only on **ALARM → OK**. The OK a brand-new alarm settles into
+  on its first evaluation (so, the deploy that creates it) is ignored, as is
+  INSUFFICIENT_DATA. A box that was started without a request is therefore never
+  stopped by this — which is why
+  [`scripts/bastion-start.sh`](../scripts/bastion-start.sh) posts a request
+  itself: a manual start gets the same 4-hour hold and the same automatic stop.
+- A request that lands just as the box is stopping is honoured: EC2 rejects a
+  start mid-stop, so the Lambda retries every 5 seconds for up to 2½ minutes.
+
+Its IAM grant is scoped to one ARN each in this account and region:
+`ec2:StartInstances` and `ec2:StopInstances` on this instance, and
+`ssm:GetParameter` on the switch below — never `*`, never a path wildcard (the
+`SecureString` credentials sit under sibling paths), and never a terminate
+action. Its resource policy lets only this alarm invoke it. Tests assert all of
+that, since this is the one thing here that runs with nobody watching.
+
+### The kill switch
+
+`/derrops/region/bastion/auto-stop/enabled` (seeded `true`) gates the **stop**
+half only. Before each stop the Lambda re-reads it and leaves the box running
+unless the value is `true` (case- and whitespace-insensitive; any other value
+suspends the stop). Starting is never gated.
+
+Suspend the stop — for an overnight job, a migration, a debugging session —
+with:
 
 ```bash
 aws ssm put-parameter --region ap-southeast-2 \
@@ -293,53 +361,32 @@ It goes through [`SeedParameter`](../lib/seed-parameter.ts) rather than being
 CloudFormation-managed, for the same reason the credentials do: `Overwrite:
 false` means it is written once and never re-asserted, so a `false` you set at
 2am survives every later `cdk deploy`. **Remember to set it back** — nothing
-re-enables it for you. If the parameter is deleted entirely the stop still runs:
-the stack seeds it `true`, so absence means the switch is gone, not off.
-
-**`schedule`** is the opposite — a read-only descriptor, so the cron can be read
-without a `cdk synth` or an `events:DescribeRule` call. Its value is taken off
-the very same `events.Schedule` object the rule is built from, so the two cannot
-drift; a test asserts it follows an overridden `autoStopSchedule`. Editing it
-changes nothing — EventBridge owns the schedule, so change the
-`autoStopSchedule` prop and deploy.
-
-### Why 18:00 UTC, and what daylight saving does
-
-An **EventBridge rule** cron is evaluated in UTC and has no timezone field at
-all, so the schedule is stated as UTC and derived in
-[`lib/bastion-stack.ts`](../lib/bastion-stack.ts) from two constants:
-`STOP_HOUR_AEST = 4` and `AEST_UTC_OFFSET_HOURS = 10` → 18:00 UTC. Being UTC, the
-same expression is correct in **every** region this stack is deployed to.
-
-AEST is fixed UTC+10, so during Sydney's daylight saving (AEDT, UTC+11) this
-fires at **05:00 local** rather than 04:00. For "power the box off overnight"
-that hour is immaterial. If it ever matters, the fix is to move the schedule off
-an EventBridge *rule* onto EventBridge **Scheduler** (`scheduler.CfnSchedule`),
-which does take `ScheduleExpressionTimezone: 'Australia/Sydney'` and follows
-the zone's DST transitions.
-
-To change the timing, pass a different `autoStopSchedule` (see the props table
-below); to suspend the stop without a deploy, use the `enabled` switch above.
+re-enables it for you, and a stop that was skipped is not retried: the alarm is
+already back in OK, so the box runs until the next request has come and gone, or
+until you stop it by hand. If the parameter is deleted entirely the stop still
+runs: the stack seeds it `true`, so absence means the switch is gone, not off.
 
 ### Where the handler lives
 
 The Lambda's source is a real file —
-[`lib/bastion-auto-stop.js`](../lib/bastion-auto-stop.js) — not a string literal
+[`lib/bastion-power.js`](../lib/bastion-power.js) — not a string literal
 inside the stack. `BastionStack` reads it **verbatim** into
 `lambda.Code.fromInline`, so an editor highlights and checks it, and what runs
 in AWS is byte-for-byte what the repo holds (a test asserts the template's
 `ZipFile` equals the file, and that it stays under `fromInline`'s 4 KB cap).
 
 It stays inline rather than becoming a `fromAsset` bundle because the whole
-function is two API calls and the AWS SDK v3 ships in the Node.js runtime —
+function is three API calls and the AWS SDK v3 ships in the Node.js runtime —
 there is nothing to build, and the code stays readable in the console and in
 `cdk diff`.
 
-Its decision logic takes the two AWS calls as injected functions, so
-[`test/bastion-auto-stop.test.ts`](../test/bastion-auto-stop.test.ts) exercises
+Its decision logic takes the AWS calls as injected functions, so
+[`test/bastion-power.test.ts`](../test/bastion-power.test.ts) exercises
 it with plain stubs — no SDK dependency, no mocking framework. That is where the
-switch semantics are pinned: `'true'` stops, anything else skips, a *deleted*
-parameter still stops, and any other SSM error is raised rather than swallowed.
+semantics are pinned: ALARM starts (ungated, retrying through a `stopping`
+box); only OK-after-ALARM stops; for the switch, `'true'` stops, anything else
+skips, a *deleted* parameter still stops, and any other SSM error is raised
+rather than swallowed.
 
 ## Discovery
 
@@ -354,8 +401,8 @@ In-app consumers receive the `instance` by reference. Out-of-app areas read SSM
 | `/derrops/region/bastion/public-ip` | The Elastic IP — stable public address, but nothing inbound is open to it |
 | `/derrops/region/bastion/eip-allocation-id` | Allocation ID of the Elastic IP (for re-association) |
 | `/derrops/region/bastion/security-group-id` | The security group, to reference as a source in another group's rules |
-| `/derrops/region/bastion/auto-stop/enabled` | Kill switch for the daily auto-stop — **editable** (see above) |
-| `/derrops/region/bastion/auto-stop/schedule` | The auto-stop cron, in UTC — read-only |
+| `/derrops/region/bastion/auto-stop/enabled` | Kill switch for the automatic stop — **editable** (see above) |
+| `/derrops/region/bastion/power-metric` | JSON `Namespace` / `MetricName` / `Dimensions` of the power-on metric — read-only (see above) |
 | `/derrops/region/bastion/ami-id` | The pinned AMI — **an input**, not an output: seeded once with the latest AL2023 arm64, then yours to change; the stack only reads it (see above) |
 
 Each is named for exactly what it holds. There is deliberately **no generic
@@ -594,7 +641,7 @@ aws ssm get-parameter --region ap-southeast-2 \
 | `vpc` | — (required) | The region's VPC (`VpcStack.vpc`) |
 | `publicSubnets` | — (required) | Public subnets (`VpcStack.publicSubnets`); the bastion lands in the first |
 | `instanceType` | `t4g.nano` | Must stay an **arm64/Graviton** type to match the AMI |
-| `autoStopSchedule` | 04:00 AEST — `cron(0 18 * * ? *)` | An `events.Schedule`; **evaluated in UTC** (a rule cron has no timezone) |
+| `powerOnHold` | 4 hours | A `cdk.Duration`: how long the box stays on after the last power-on request. Whole minutes, at most 1 day (CloudWatch's limit on an alarm's evaluation window) |
 | `instanceTerminationProtection` | `true` | EC2 `DisableApiTermination` (see above). Set `false` before `cdk destroy`. Not `terminationProtection` — `cdk.StackProps` owns that name for protecting the *stack* |
 | `amiId` | read from `/derrops/region/bastion/ami-id` | Pins the AMI in source instead. Leave unset — an id here is a different image, or none, in the next region. For tests and one-off recovery |
 

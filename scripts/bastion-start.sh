@@ -19,6 +19,12 @@
 # ap-southeast-2's box rather than erroring. The script says so on stderr
 # whenever it falls back.
 #
+# It also posts one power-on request to the bastion's CloudWatch metric, so the
+# stack's alarm holds the box on and then stops it once the hold (4 hours by
+# default) has passed with no further request — a box started here is not left
+# running forever. To keep it up longer, post again, or suspend the stop with
+# /derrops/region/bastion/auto-stop/enabled.
+#
 # Note: the instance gets a *new* auto-assigned public IPv4 on every start.
 # Nothing here depends on it (SSM and Tailscale are both outbound-initiated),
 # but do not pin anything to that address. Tailscale, if you brought it up
@@ -32,6 +38,13 @@ set -euo pipefail
 # shell script cannot call the library.
 readonly PARAM_NAME='/derrops/region/bastion/instance-id'
 
+# The power-on metric BastionStack's alarm watches — `powerMetric` in
+# lib/bastion-stack.ts, also published at /derrops/region/bastion/power-metric.
+# Mirrored here for the same reason as PARAM_NAME.
+readonly METRIC_NAMESPACE='derrops/region'
+readonly METRIC_NAME='PowerOnRequests'
+readonly METRIC_DIMENSIONS='service=bastion'
+
 # Region used when the caller omits one.
 readonly DEFAULT_REGION='ap-southeast-2'
 
@@ -40,7 +53,9 @@ usage() {
 Usage: bastion-start.sh [aws-region] [options]
 
 Starts that region's bastion instance. Idempotent: a start of an
-already-running instance is reported and exits 0.
+already-running instance is reported and exits 0. Also posts a power-on
+request, so the box is stopped again automatically once the stack's hold
+(4 hours by default) passes with no further request.
 
 Arguments:
   [aws-region]            Region the bastion lives in (e.g. ap-southeast-2).
@@ -162,6 +177,18 @@ case "$state" in
       --output text >/dev/null
     ;;
 esac
+
+# Register the start with the power alarm. Without this the alarm never enters
+# ALARM, so it never comes back to OK, and nothing would ever stop the box. Not
+# fatal: the instance is already starting, so say what was lost and carry on.
+aws cloudwatch put-metric-data \
+  --region "$region" \
+  --namespace "$METRIC_NAMESPACE" \
+  --metric-name "$METRIC_NAME" \
+  --dimensions "$METRIC_DIMENSIONS" \
+  --value 1 \
+  || echo "warning: could not post ${METRIC_NAMESPACE} ${METRIC_NAME} in ${region} — the bastion
+         will NOT be stopped automatically. Stop it with bastion-stop.sh." >&2
 
 if [[ "$wait_for_state" != 'true' ]]; then
   echo "Start requested for ${instance_id} (${region}). It takes a minute or two before

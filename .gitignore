@@ -4,9 +4,9 @@
 # in a commit (and then never reaches a deploy).
 *.js
 !jest.config.js
-# The auto-stop Lambda handler, read verbatim into lambda.Code.fromInline by
-# lib/bastion-stack.ts. Source, not output — there is no bastion-auto-stop.ts.
-!lib/bastion-auto-stop.js
+# The bastion power Lambda handler, read verbatim into lambda.Code.fromInline by
+# lib/bastion-stack.ts. Source, not output — there is no bastion-power.ts.
+!lib/bastion-power.js
 *.d.ts
 node_modules
 
